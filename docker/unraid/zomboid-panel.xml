@@ -2,18 +2,18 @@
 <Container version="2">
   <Name>Zomboid Control Panel</Name>
   <Repository>ghcr.io/3bdelrahmanashraf/pz-control-panel:latest</Repository>
-  <Registry>https://github.com/3bdelrahmanashraf/Project-Zomboid-Control-Panel/pkgs/container/zomboid-panel</Registry>
+  <Registry>https://github.com/3bdelrahmanashraf/Linux-Panel/pkgs/container/zomboid-panel</Registry>
   <Network>bridge</Network>
   <MyIP/>
   <Shell>bash</Shell>
   <Privileged>false</Privileged>
-  <Support>https://github.com/3bdelrahmanashraf/Project-Zomboid-Control-Panel/issues</Support>
-  <Project>https://github.com/3bdelrahmanashraf/Project-Zomboid-Control-Panel</Project>
+  <Support>https://github.com/3bdelrahmanashraf/Linux-Panel/issues</Support>
+  <Project>https://github.com/3bdelrahmanashraf/Linux-Panel</Project>
   <Overview>Web control panel for Project Zomboid. This template runs the panel beside an existing PZ container; it does not run PZ itself.</Overview>
   <Category>GameServers:Management</Category>
   <WebUI>http://[IP]:[PORT:3001]/</WebUI>
-  <TemplateURL>https://raw.githubusercontent.com/3bdelrahmanashraf/Project-Zomboid-Control-Panel/main/docker/unraid/zomboid-panel.xml</TemplateURL>
-  <Icon>https://raw.githubusercontent.com/3bdelrahmanashraf/Project-Zomboid-Control-Panel/main/client/public/zombie.svg</Icon>
+  <TemplateURL>https://raw.githubusercontent.com/3bdelrahmanashraf/Linux-Panel/main/docker/unraid/zomboid-panel.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/3bdelrahmanashraf/Linux-Panel/main/client/public/zombie.svg</Icon>
   <ExtraParams/>
   <PostArgs/>
   <CPUset/>

@@ -9,7 +9,7 @@ Security fixes are applied to the latest release and the `main` branch.
 Please do not report a vulnerability in a public issue or pull request.
 Report it privately on GitHub instead: open the repository's **Security**
 tab and choose **Report a vulnerability**
-(<https://github.com/3bdelrahmanashraf/Project-Zomboid-Control-Panel/security/advisories/new>).
+(<https://github.com/3bdelrahmanashraf/Linux-Panel/security/advisories/new>).
 Only the maintainer sees the report, and the fix can be prepared before
 anything is published.
 

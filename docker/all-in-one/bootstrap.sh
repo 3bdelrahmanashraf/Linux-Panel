@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-REPOSITORY="3bdelrahmanashraf/Project-Zomboid-Control-Panel"
+REPOSITORY="3bdelrahmanashraf/Linux-Panel"
 REGISTRY="ghcr.io/3bdelrahmanashraf"
 VERSION="${1:-}"
 

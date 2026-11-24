@@ -57,7 +57,7 @@ services:
       COMPOSE_FILE: /build/ctx/docker-compose.yml
       PANEL_CONTAINER: zomboid-panel
       PANEL_IMAGE: zomboid-panel-allinone:latest
-      GITHUB_REPOSITORY: 3bdelrahmanashraf/Project-Zomboid-Control-Panel
+      GITHUB_REPOSITORY: 3bdelrahmanashraf/Linux-Panel
       # security audit M5: optional SHA-256 of the release source archive.
       # When set, the updater refuses any archive that does not match it --
       # which means it pins ONE release: every other version (newer ones

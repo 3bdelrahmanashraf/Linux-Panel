@@ -1,7 +1,7 @@
 {
   "name": "pz-control-panel",
   "version": "1.4.11",
-  "description": "PZ Control Panel - modern Project Zomboid server management",
+  "description": "Linux Panel - Project Zomboid 42.20 dedicated server management",
   "main": "server/index.js",
   "type": "module",
   "scripts": {
@@ -82,10 +82,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/3bdelrahmanashraf/Project-Zomboid-Control-Panel.git"
+    "url": "git+https://github.com/3bdelrahmanashraf/Linux-Panel.git"
   },
-  "homepage": "https://github.com/3bdelrahmanashraf/Project-Zomboid-Control-Panel#readme",
+  "homepage": "https://github.com/3bdelrahmanashraf/Linux-Panel#readme",
   "bugs": {
-    "url": "https://github.com/3bdelrahmanashraf/Project-Zomboid-Control-Panel/issues"
+    "url": "https://github.com/3bdelrahmanashraf/Linux-Panel/issues"
   }
 }

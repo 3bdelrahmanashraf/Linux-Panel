@@ -9,7 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Project Zomboid Control Panel identity:** the panel is now branded as Project Zomboid Control Panel, with its own repository, metadata, documentation, and update channel under `3bdelrahmanashraf/Project-Zomboid-Control-Panel`.
+- **Linux Panel identity:** the repository and panel display name are now Linux Panel, with metadata, documentation, and update channel under `3bdelrahmanashraf/Linux-Panel`.
+- **Game version pin:** this build targets **Project Zomboid 42.20 only**; other game builds are not supported by this panel version.
 - **Charcoal & Sage design system:** a token-driven visual language with charcoal (`#111111`) surfaces, sage (`#7E846B`) accents, glassy cards, rounded controls, refined typography, and modern dialogs/tables/navigation.
 - **Export Mods workspace:** mod count, total size, folder search, byte-accurate ZIP progress, validated public links, copy buttons, and single-flight uploads are now exposed on `/export-mods`.
 - **Command tab layout:** tabs use segmented command rails with sage active pills, glow indicators, compact variants for dense pages, and a vertical glass navigation rail in Settings.
@@ -3349,7 +3350,7 @@ reliability, then interface and translation.
 
 ### Fixed
 
-- **Container failed to start under a non-root Kubernetes securityContext** ([#34](https://github.com/3bdelrahmanashraf/Project-Zomboid-Control-Panel/issues/34)): a pod that pins `runAsUser`/`runAsGroup` with `runAsNonRoot: true` never starts as root, so the entrypoint's `chown` failed with "Operation not permitted" and killed the script, and `setpriv --clear-groups` would then have failed too because `setgroups()` needs `CAP_SETGID`. Adding the `CHOWN` capability does not help, since Kubernetes only places it in a non-root container's bounding set. The entrypoint now detects that it is already running as a non-root user, skips both the ownership fix and the privilege drop, and executes the panel directly; it prints a note when the running UID/GID differs from `PUID`/`PGID`. Plain Docker and Docker Compose are unaffected and keep the existing `PUID`/`PGID` behaviour. The init-container and `command` overrides previously needed as a workaround can be removed.
+- **Container failed to start under a non-root Kubernetes securityContext** ([#34](https://github.com/3bdelrahmanashraf/Linux-Panel/issues/34)): a pod that pins `runAsUser`/`runAsGroup` with `runAsNonRoot: true` never starts as root, so the entrypoint's `chown` failed with "Operation not permitted" and killed the script, and `setpriv --clear-groups` would then have failed too because `setgroups()` needs `CAP_SETGID`. Adding the `CHOWN` capability does not help, since Kubernetes only places it in a non-root container's bounding set. The entrypoint now detects that it is already running as a non-root user, skips both the ownership fix and the privilege drop, and executes the panel directly; it prints a note when the running UID/GID differs from `PUID`/`PGID`. Plain Docker and Docker Compose are unaffected and keep the existing `PUID`/`PGID` behaviour. The init-container and `command` overrides previously needed as a workaround can be removed.
 - **Discord no longer reports the server online while it is still starting**: the Server Started notification now waits for an authenticated RCON connection instead of firing as soon as the Java process appears.
 - **Chat no longer duplicates panel-sent General messages**: the page now recognises the server log's `[Admin] message` echo as the matching optimistic local entry.
 - **Build 42 top-down map tiles load again**: the map proxy resolves the current upstream build and image format rather than assuming the old WebP endpoint.
@@ -3588,7 +3589,7 @@ reliability, then interface and translation.
 
 ### Fixed
 
-- **Docker SteamCMD support**: the standard amd64 Docker image now uses a glibc-based runtime with Bash and the required 32-bit SteamCMD libraries, so Linux Docker installations can use the panel's SteamCMD setup and update workflows. The image remains multi-architecture for arm64 remote-server administration. Thanks to @Lynkes for identifying the Docker compatibility issue in [#16](https://github.com/3bdelrahmanashraf/Project-Zomboid-Control-Panel/pull/16).
+- **Docker SteamCMD support**: the standard amd64 Docker image now uses a glibc-based runtime with Bash and the required 32-bit SteamCMD libraries, so Linux Docker installations can use the panel's SteamCMD setup and update workflows. The image remains multi-architecture for arm64 remote-server administration. Thanks to @Lynkes for identifying the Docker compatibility issue in [#16](https://github.com/3bdelrahmanashraf/Linux-Panel/pull/16).
 - **Clean Docker builds**: the image no longer requires an untracked generated browser-extension ZIP that is excluded from the Docker build context. The extension download endpoint continues to report clearly when a bundle is unavailable.
 
 ## [1.1.5] - 2026-07-29
@@ -3812,6 +3813,6 @@ reliability, then interface and translation.
 - 6 color themes (Dark, Midnight, Crimson, Forest, Hacker, Vapor).
 - Responsive design with mobile support.
 
-[1.0.6]: https://github.com/3bdelrahmanashraf/Project-Zomboid-Control-Panel/compare/v1.0.1...v1.0.6
-[1.0.1]: https://github.com/3bdelrahmanashraf/Project-Zomboid-Control-Panel/compare/v1.0.0...v1.0.1
-[1.0.0]: https://github.com/3bdelrahmanashraf/Project-Zomboid-Control-Panel/releases/tag/v1.0.0
+[1.0.6]: https://github.com/3bdelrahmanashraf/Linux-Panel/compare/v1.0.1...v1.0.6
+[1.0.1]: https://github.com/3bdelrahmanashraf/Linux-Panel/compare/v1.0.0...v1.0.1
+[1.0.0]: https://github.com/3bdelrahmanashraf/Linux-Panel/releases/tag/v1.0.0

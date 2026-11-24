@@ -4,7 +4,7 @@ name: Build AIO Docker Image
 # SteamCMD + the PZ dedicated server in one image). Deliberately kept as its
 # own workflow, independent of docker-publish.yml: that workflow publishes
 # the standard panel-only image this repo shares a history with upstream
-# (3bdelrahmanashraf/Project-Zomboid-Control-Panel), and must keep working unmodified if/when
+# (3bdelrahmanashraf/Linux-Panel), and must keep working unmodified if/when
 # this fork's changes go back upstream as a PR. The AIO image is this fork's
 # own addition — publishing it here, under its own tag, on its own trigger
 # paths, means it can never affect (or conflict with) the upstream-shared

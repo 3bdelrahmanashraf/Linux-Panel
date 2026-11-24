@@ -11,7 +11,7 @@ right before moving to the next one.
 ## Phase 1: Download and extract the release zip
 
 1. Download `PZControlPanel-windows.zip` from
-   [Releases](https://github.com/3bdelrahmanashraf/Project-Zomboid-Control-Panel/releases/latest).
+   [Releases](https://github.com/3bdelrahmanashraf/Linux-Panel/releases/latest).
 2. Right-click the downloaded zip → **Extract All...** → pick a folder (for
    example `C:\ZomboidPanel`) → **Extract**.
 

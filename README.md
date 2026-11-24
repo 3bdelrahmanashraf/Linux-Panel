@@ -1,16 +1,14 @@
-<h1 align="center">Project Zomboid Control Panel</h1>
+<h1 align="center">Linux Panel</h1>
 
 <p align="center">
-  <a href="https://github.com/3bdelrahmanashraf/Project-Zomboid-Control-Panel/releases/latest"><img src="https://img.shields.io/github/v/release/3bdelrahmanashraf/Project-Zomboid-Control-Panel?style=for-the-badge&amp;logo=github&amp;color=7E846B" alt="Latest release"></a>
-  <a href="https://github.com/3bdelrahmanashraf/Project-Zomboid-Control-Panel/releases"><img src="https://img.shields.io/github/downloads/3bdelrahmanashraf/Project-Zomboid-Control-Panel/total?style=for-the-badge&amp;logo=github&amp;color=7E846B" alt="Downloads"></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-7E846B?style=for-the-badge" alt="MIT license"></a>
-  <a href="https://github.com/3bdelrahmanashraf/Project-Zomboid-Control-Panel"><img src="https://img.shields.io/badge/platform-Linux%20%7C%20Docker-5F6B4A?style=for-the-badge&amp;logo=linux" alt="Linux and Docker"></a>
+  <a href="https://github.com/3bdelrahmanashraf/Linux-Panel"><img src="https://img.shields.io/badge/platform-Linux%20%7C%20Docker-5F6B4A?style=for-the-badge&amp;logo=linux" alt="Linux and Docker"></a>
 </p>
 
-<p align="center"><em>A charcoal-and-sage command deck for Project Zomboid dedicated servers.</em></p>
+<p align="center"><em>A charcoal-and-sage command deck for Project Zomboid 42.20 dedicated servers.</em></p>
 
-**Project Zomboid Control Panel** is a self-hosted web application for running,
-watching, configuring, and repairing a Project Zomboid dedicated server. It
+**Linux Panel** is a self-hosted web application for running, watching,
+configuring, and repairing a Project Zomboid 42.20 dedicated server. It
 puts the console, players, mods, exports, backups, scheduler, world tools, and
 settings behind one operator surface instead of a pile of separate utilities.
 
@@ -19,6 +17,10 @@ this repository is an independently edited version with design overrides, a
 renamed identity, detached update/support links, export and upload fixes, and
 live-server tuning. The proven server-control layer is kept; the experience
 around it is rebuilt.
+
+> **Game version:** this build targets **Project Zomboid 42.20 only**. The server
+> contract, mod layout, PanelBridge wiring, and export paths are pinned to that
+> game build; do not use this panel version with another Project Zomboid version.
 
 > **Operator rule:** stop PZ before restarting the panel for a config change,
 > then restore `autoStartServer=true` and start PZ again. This avoids duplicate
@@ -55,12 +57,13 @@ the running server and browser client continue to match.
 
 | Area | State | Notes |
 |---|---|---|
+| Game version | Pinned | **Project Zomboid 42.20 only**; other game builds are not supported by this panel version. |
 | Panel shell | Shipped | Charcoal (`#111111`) / sage (`#7E846B`) tokens, top dropdown nav on desktop, bottom pop-up dock on small screens. |
 | Server lifecycle | Preserved | Start, stop, restart, save, install, update, and guarded state transitions. |
 | Mods and exports | Extended | 340 required of 355 tracked IDs; byte-accurate ZIP progress, link validation, single-flight uploads. |
 | Upstream detachment | Done | Self-update checks, docs, badges, in-app links, scripts, and CI point only to this repository. |
 | PanelBridge Workshop item | Intentionally inherited | Workshop ID unchanged so existing servers keep working. Republishing under a new Steam identity is a separate step. |
-| Vehicle-entry warning | Suppressed, verifying | `VehicleClaims4220MP` still fails closed on invalid claims; the misleading player notification is removed. |
+| Vehicle-entry warning | Suppressed | `VehicleClaims4220MP` still fails closed on invalid claims; the misleading player notification is removed. |
 | RCON mismatch diagnostics | Deprioritized | Treated as diagnostics for this deployment, not a panel failure. |
 
 ---
@@ -73,8 +76,8 @@ The repository ships a full `docker-compose.yml`. It builds locally by default
 and tags the image under this project's namespace.
 
 ```bash
-git clone https://github.com/3bdelrahmanashraf/Project-Zomboid-Control-Panel.git
-cd Project-Zomboid-Control-Panel
+git clone https://github.com/3bdelrahmanashraf/Linux-Panel.git
+cd Linux-Panel
 
 # Review volume paths and ports before starting.
 nano docker-compose.yml
@@ -99,8 +102,8 @@ Requirements:
 - The PanelBridge mod installed on the server for deep integration
 
 ```bash
-git clone https://github.com/3bdelrahmanashraf/Project-Zomboid-Control-Panel.git
-cd Project-Zomboid-Control-Panel
+git clone https://github.com/3bdelrahmanashraf/Linux-Panel.git
+cd Linux-Panel
 
 npm install
 cd client && npm install && cd ..
@@ -195,7 +198,7 @@ Configuration comes from environment variables plus the panel database.
 | `PUID` / `PGID` | `1000` | Container user/group for mounted server files |
 | `JWT_SECRET` | generated | Session signing secret; set explicitly in production |
 | `CORS_ORIGIN` | auto | Allowed browser origin; pin behind a reverse proxy |
-| `GITHUB_REPOSITORY` | `3bdelrahmanashraf/Project-Zomboid-Control-Panel` | Update-check repository only |
+| `GITHUB_REPOSITORY` | `3bdelrahmanashraf/Linux-Panel` | Update-check repository only |
 
 Important database settings:
 
@@ -336,7 +339,7 @@ The checker in `server/services/panelUpdateChecker.js` uses:
 
 ```js
 const GITHUB_OWNER = "3bdelrahmanashraf";
-const GITHUB_REPO = "Project-Zomboid-Control-Panel";
+const GITHUB_REPO = "Linux-Panel";
 ```
 
 It checks only this repository's Releases. It does not query the original

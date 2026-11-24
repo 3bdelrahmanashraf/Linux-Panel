@@ -328,7 +328,7 @@ here in this folder, so they work with no internet — and also live on
 GitHub if you'd rather read them there or check for updates to them:
 
   docs/install/                                    (this folder, offline)
-  https://github.com/3bdelrahmanashraf/Project-Zomboid-Control-Panel  (same guides, online)
+  https://github.com/3bdelrahmanashraf/Linux-Panel  (same guides, online)
 
 - docs/install/windows.md         Windows: running at startup / as a service, firewall.
 - docs/install/linux.md           Linux: the bundled systemd service, a non-root

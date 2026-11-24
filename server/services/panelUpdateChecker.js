@@ -3,7 +3,7 @@
  *
  * Checks for new PZ Control Panel releases on this fork's GitHub repo only.
  * No connection to any upstream/original-author repository is made.
- * - Periodically checks github.com/3bdelrahmanashraf/Project-Zomboid-Control-Panel/releases
+ * - Periodically checks github.com/3bdelrahmanashraf/Linux-Panel/releases
  * - Compares installed version vs latest GitHub release
  * - Downloads and replaces the binary for one-click updates (exe mode only)
  */
@@ -25,7 +25,7 @@ import { stageUpdateBundle } from "./updateBundle.js";
 const log = createLogger("PanelUpdater");
 
 const GITHUB_OWNER = "3bdelrahmanashraf";
-const GITHUB_REPO = "Project-Zomboid-Control-Panel";
+const GITHUB_REPO = "Linux-Panel";
 const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000; // Check every 6 hours
 const GITHUB_API_TIMEOUT_MS = 15000;
 const DOWNLOAD_TIMEOUT_MS = 60000;

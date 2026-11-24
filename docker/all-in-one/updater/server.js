@@ -13,7 +13,7 @@ const COMPOSE_FILE = process.env.COMPOSE_FILE || path.join(BUILD_ROOT, "ctx", "d
 const PANEL_SERVICE = process.env.PANEL_SERVICE || "panel";
 const PANEL_CONTAINER = process.env.PANEL_CONTAINER || "zomboid-panel";
 const PANEL_IMAGE = process.env.PANEL_IMAGE || "zomboid-panel-allinone:latest";
-const GITHUB_REPOSITORY = process.env.GITHUB_REPOSITORY || "3bdelrahmanashraf/Project-Zomboid-Control-Panel";
+const GITHUB_REPOSITORY = process.env.GITHUB_REPOSITORY || "3bdelrahmanashraf/Linux-Panel";
 // security audit M5: optional. When set, the downloaded release archive must
 // match this SHA-256 or the update is refused. GitHub publishes checksums for
 // release artifacts (checksums.txt) but not for source tarballs, so a

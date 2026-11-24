@@ -50,7 +50,7 @@ need `sudo` in front of the commands below).
 
 3. Run:
    ```sh
-   curl -fsSL https://raw.githubusercontent.com/3bdelrahmanashraf/Project-Zomboid-Control-Panel/main/docker/all-in-one/bootstrap.sh | sh
+   curl -fsSL https://raw.githubusercontent.com/3bdelrahmanashraf/Linux-Panel/main/docker/all-in-one/bootstrap.sh | sh
    ```
    This resolves the latest release, creates its state under
    `~/.local/state/zomboid-panel/` (override with the `PANEL_HOME` or
@@ -61,7 +61,7 @@ need `sudo` in front of the commands below).
    To install a specific version instead of the latest release, pass it as
    an argument:
    ```sh
-   curl -fsSL https://raw.githubusercontent.com/3bdelrahmanashraf/Project-Zomboid-Control-Panel/main/docker/all-in-one/bootstrap.sh | sh -s -- 1.2.6
+   curl -fsSL https://raw.githubusercontent.com/3bdelrahmanashraf/Linux-Panel/main/docker/all-in-one/bootstrap.sh | sh -s -- 1.2.6
    ```
 
    For the panel and updater images, it pulls the exact release-tagged image
@@ -206,8 +206,8 @@ container as the panel.
 
 4. ```sh
    mkdir -p ~/zomboid-panel && cd ~/zomboid-panel
-   curl -O https://raw.githubusercontent.com/3bdelrahmanashraf/Project-Zomboid-Control-Panel/main/docker-compose.yml
-   curl -O https://raw.githubusercontent.com/3bdelrahmanashraf/Project-Zomboid-Control-Panel/main/.env.example
+   curl -O https://raw.githubusercontent.com/3bdelrahmanashraf/Linux-Panel/main/docker-compose.yml
+   curl -O https://raw.githubusercontent.com/3bdelrahmanashraf/Linux-Panel/main/.env.example
    mv .env.example .env
    ```
 
@@ -364,7 +364,7 @@ panel before committing to a full setup.
 ### Phase 2 — Start it
 
 2. ```sh
-   curl -O https://raw.githubusercontent.com/3bdelrahmanashraf/Project-Zomboid-Control-Panel/main/docker-compose.install.yml
+   curl -O https://raw.githubusercontent.com/3bdelrahmanashraf/Linux-Panel/main/docker-compose.install.yml
    docker compose -f docker-compose.install.yml up -d
    ```
    `pull_policy: always` means every `up -d` you run later fetches the
@@ -412,7 +412,7 @@ install or run Project Zomboid itself.
 ### Phase 2 — Import and configure
 
 2. In Unraid's **Docker** tab, add the container from template:
-   `https://raw.githubusercontent.com/3bdelrahmanashraf/Project-Zomboid-Control-Panel/main/docker/unraid/zomboid-panel.xml`
+   `https://raw.githubusercontent.com/3bdelrahmanashraf/Linux-Panel/main/docker/unraid/zomboid-panel.xml`
    (or search "Zomboid Control Panel" if it's listed in Community
    Applications).
 3. Set these four path mappings — the panel's own two are pre-filled, the
