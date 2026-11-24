@@ -36,7 +36,6 @@ around it is rebuilt.
 - [Run shape](#run-shape)
 - [Control surface](#control-surface)
 - [Configuration](#configuration)
-- [Live deployment notes](#live-deployment-notes)
 - [What is changed / what is kept](#what-is-changed--what-is-kept)
 - [Troubleshooting](#troubleshooting)
 - [Files](#files)
@@ -59,7 +58,6 @@ the running server and browser client continue to match.
 | Panel shell | Shipped | Charcoal (`#111111`) / sage (`#7E846B`) tokens, top dropdown nav on desktop, bottom pop-up dock on small screens. |
 | Server lifecycle | Preserved | Start, stop, restart, save, install, update, and guarded state transitions. |
 | Mods and exports | Extended | 340 required of 355 tracked IDs; byte-accurate ZIP progress, link validation, single-flight uploads. |
-| Live deployment | Stable | Instance shaped around `Youtoob`; 432 detected mods, ~8.24 GB export set. |
 | Upstream detachment | Done | Self-update checks, docs, badges, in-app links, scripts, and CI point only to this repository. |
 | PanelBridge Workshop item | Intentionally inherited | Workshop ID unchanged so existing servers keep working. Republishing under a new Steam identity is a separate step. |
 | Vehicle-entry warning | Suppressed, verifying | `VehicleClaims4220MP` still fails closed on invalid claims; the misleading player notification is removed. |
@@ -217,36 +215,6 @@ Generated startup flags:
 These reduce JVM pauses from shared-memory GC accounting and explicit GC calls.
 The generator in `server/routes/server.js` writes them on every regeneration so
 hand-edited scripts are not lost.
-
----
-
-## Live deployment notes
-
-These notes describe the production instance this fork was shaped around.
-
-| Item | Value |
-|---|---|
-| Server name | `Youtoob` |
-| Panel host URL | `http://127.0.0.1:7177` |
-| Panel container URL | `http://127.0.0.1:7575` |
-| Container | `zomboid-panel` |
-| Active server config | `/pz-servers/Youtoob_Data/Server/Youtoob.ini` |
-| Sandbox preset | `/pz-servers/Youtoob_Data/Server/Youtoob_SandboxVars.lua` |
-| Patched vehicle mod | `/pz-servers/Youtoob_Data/mods/VehicleClaims4220MP/42/media/lua/server/VehicleClaims_Server.lua` |
-| Generated startup script | `/pz-servers/Youtoob/start-server_Youtoob.sh` |
-| Panel database | `/app/data/db.json` |
-| Default theme | Charcoal & Sage (`theme-survival` key) |
-| Required mods | 340 of 355 tracked IDs |
-| Detected mod set | 432 mods, 159,006 files, ~8.24 GB |
-| Export fingerprint | `66:159006:8243751191` |
-| Current public export link | `https://vikingfile.com/f/uPlMW1s4Z8` |
-
-Operational rules:
-
-1. **Never restart the panel while PZ is running for a config change that needs a restart.** Stop PZ first, restart the panel, then restore auto-start and start PZ.
-2. `autoStartServer=true` and `serverAutoUpdate=false` are the intended live settings.
-3. PZ startup with the full mod set takes roughly 6–10 minutes. Early API timeouts are expected.
-4. VikingFile links redirect from `vikingfile.com/f/<hash>` to `vik1ngfile.site/f/<hash>`. A dead hash returns HTTP 404 and is re-uploaded automatically.
 
 ---
 
