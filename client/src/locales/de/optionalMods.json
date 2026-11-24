@@ -1,0 +1,81 @@
+{
+  "shared": {
+    "errorTitle": "Error",
+    "successTitle": "Success"
+  },
+  "page": {
+    "title": "Optional Mods",
+    "description": "Mods clients can join without. Optional IDs are kept out of the server's Mods= line, so the game never asks joining clients to install them.",
+    "loading": "Loading installed mods...",
+    "refresh": "Refresh",
+    "badge": "{{required}} required · {{optional}} optional"
+  },
+  "stats": {
+    "required": "Required",
+    "optional": "Optional",
+    "installed": "Installed",
+    "available": "Not required"
+  },
+  "how": {
+    "title": "How optional mods work",
+    "body": "Project Zomboid disconnects a client when any advertised server mod is missing. This page solves that by not advertising the mod at all. The server will not load optional mods; clients that have them can still use them locally."
+  },
+  "optional": {
+    "title": "Optional (non-required) mods",
+    "description": "Clients can join without these. Save the list, then apply it to remove them from the server's Mods= line.",
+    "empty": "No optional mods yet. Add one from the list on the right or move a required mod here.",
+    "noMatches": "No optional mods match your search.",
+    "search": "Search optional mods",
+    "remove": "Remove from optional list",
+    "save": "Save list",
+    "saving": "Saving...",
+    "apply": "Apply to server",
+    "applying": "Applying...",
+    "dirty": "You have unsaved changes. Save the list, then apply it to rewrite the server INI.",
+    "saved": "Optional mod list saved. Apply it to update the server INI.",
+    "savedRejected": "Optional mod list saved. {{count}} invalid IDs were ignored.",
+    "applied": "Removed {{count}} mod(s) from the server's Mods= line. {{required}} required mods remain.",
+    "nothingRemoved": "No changes were needed; the server already excludes these mods.",
+    "currentlyRequired": "Currently required — apply to remove"
+  },
+  "available": {
+    "title": "Add a mod",
+    "description": "Installed mods that are neither required nor optional. Pick one to make it optional.",
+    "search": "Search installed mods",
+    "empty": "Every installed mod is already required or optional.",
+    "noMatches": "No installed mods match your search.",
+    "add": "Make optional"
+  },
+  "required": {
+    "title": "Required mods ({{count}})",
+    "description": "These IDs are in the server's Mods= line. Every joining client must have them installed.",
+    "search": "Search required mods",
+    "empty": "No required mods in the server INI.",
+    "noMatches": "No required mods match your search.",
+    "makeOptional": "Make optional",
+    "truncated": "Showing the first {{shown}} of {{total}}. Use search to narrow the list."
+  },
+  "badges": {
+    "clientOnly": "Client-only",
+    "serverContent": "Server content",
+    "shared": "Shared Lua",
+    "noContent": "No content",
+    "missing": "Not installed",
+    "requires": "Requires {{count}} mod(s)"
+  },
+  "restart": {
+    "title": "Restart needed",
+    "body": "Restart the Project Zomboid server from the Servers page so it reloads the INI with the new Mods= list."
+  },
+  "errors": {
+    "noPermissionTitle": "Read-only",
+    "noPermission": "You need the Mods permission to change optional mods.",
+    "load": "Could not load installed mods.",
+    "save": "Could not save the optional mod list.",
+    "apply": "Could not apply the optional mod list to the server INI.",
+    "noModsFolderTitle": "Mods folder not found",
+    "noModsFolder": "The active server's Zomboid data folder has no mods folder. Set the path on the server profile, then refresh.",
+    "missingOptionalTitle": "Some optional mods are not installed",
+    "missingOptional": "{{count}} optional ID(s) are not in the local mods folder. They stay excluded from the server, but clients that want them cannot load them until they are installed."
+  }
+}

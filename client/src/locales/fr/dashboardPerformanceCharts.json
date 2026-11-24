@@ -1,0 +1,10 @@
+{
+  "pzMemory": "Mémoire PZ",
+  "players": "Joueurs",
+  "hostCpu": "CPU hôte",
+  "hostMemory": "Mémoire hôte",
+  "hostSwap": "Swap hôte",
+  "disk": "Disque",
+  "onlineUnit": "en ligne",
+  "normal": "normal"
+}

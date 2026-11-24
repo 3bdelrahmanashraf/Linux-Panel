@@ -1,0 +1,45 @@
+# Scripts that run inside Linux containers must keep LF endings. Without this,
+# a checkout or `git archive` on Windows (core.autocrlf=true) rewrites the
+# shebang to "#!/bin/bash\r" and the container fails with
+# "exec /entrypoint.sh: no such file or directory".
+*.sh text eol=lf
+entrypoint.sh text eol=lf
+Start.bat text eol=crlf
+
+# Same failure class as the *.sh rule above, one file this repo had missed
+# (hunt-wave6-2026-08-29): a systemd unit file, always installed and parsed
+# on the target Linux machine regardless of which OS checked it out. Copied
+# verbatim by build.js (fs.copyFileSync, no normalization -- contrast with
+# generateStartSh()'s explicit .replace(/\r\n/g, "\n") two lines above that
+# copy) into every Linux release package. Without this rule, a Windows
+# checkout (core.autocrlf=true) puts a trailing \r on every directive line;
+# confirmed on this exact file in this exact repo, not assumed: `xxd` showed
+# real 0d0a bytes on a Windows checkout before this rule existed. Only bites
+# a LOCALLY-run `npm run build:exe:linux`/`node build.js --linux` on
+# Windows -- release-artifacts.yml builds the Linux leg on ubuntu-22.04, so
+# CI-published releases were never affected.
+zomboid-panel.service text eol=lf
+
+# Defense in depth for the CSP script-hash bug (browser-bug-hunt-2026-09-02):
+# server/utils/cspScriptHash.js now newline-normalizes before hashing, which
+# is the real fix and correct on any checkout regardless of line endings --
+# but pinning this file to LF removes the CRLF case entirely on machines
+# where core.autocrlf=true would otherwise check it out with CRLF.
+client/index.html text eol=lf
+
+# PanelBridge sources ship byte-for-byte to servers and players (loose install
+# and the Steam Workshop item), and their normalized bytes are hashed into
+# pz-mod/bridge-version.lock.json. The index already holds LF; pinning it here
+# keeps Windows checkouts (core.autocrlf=true) identical to CI and Linux.
+# scripts/workshop/build-item.mjs normalizes anyway; this removes the case.
+pz-mod/**/*.lua text eol=lf
+pz-mod/**/mod.info text eol=lf
+pz-mod/**/*.json text eol=lf
+pz-mod/**/*.txt text eol=lf
+pz-mod/**/*.png binary
+
+# server/__fixtures__/pzVanillaB42SandboxVars.lua is SandboxVars.lua exactly as
+# game build 42.21 writes it on Windows (SandboxOptions.writeLuaFile, CRLF).
+# The #197 round-trip tests compare it byte for byte, so git must not
+# normalize its line endings on any checkout.
+server/__fixtures__/*.lua -text

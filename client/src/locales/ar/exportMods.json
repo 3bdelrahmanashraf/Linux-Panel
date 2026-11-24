@@ -1,0 +1,88 @@
+{
+  "page": {
+    "title": "Export Mods",
+    "description": "Package the server's local mods folder as a ZIP, upload it to VikingFile, and share a public link. The preview shows exactly which folders, files, and bytes will be included.",
+    "eyebrow": "SERVER · EXPORT MODS",
+    "badge": "{{count}} mod folders",
+    "loading": "Measuring the mods folder…"
+  },
+  "summary": {
+    "line": "{{count}} mod folders · {{files}} files · {{size}}"
+  },
+  "stats": {
+    "mods": "Mod folders",
+    "files": "Files",
+    "size": "Total size",
+    "server": "Server",
+    "unknownServer": "No server selected",
+    "path": "Mods folder"
+  },
+  "actions": {
+    "title": "Export actions",
+    "description": "Build the ZIP locally, then upload it to VikingFile for a link anyone can open.",
+    "refresh": "Refresh",
+    "retry": "Retry",
+    "modManager": "Mod Manager",
+    "upload": "Upload to VikingFile",
+    "uploading": "Uploading…",
+    "reupload": "Upload a new copy",
+    "download": "Download .zip",
+    "copyMods": "Copy mod names",
+    "copyLink": "Copy public link",
+    "copyPanelLink": "Copy panel ZIP link"
+  },
+  "progress": {
+    "title": "Export progress",
+    "waiting": "Waiting to start…",
+    "measuring": "Measuring the mods folder…",
+    "zipping": "Creating the ZIP archive…",
+    "uploading": "Uploading to VikingFile…",
+    "verifying": "Verifying the public link…",
+    "done": "Upload complete",
+    "failed": "Upload failed",
+    "cached": "reused the previous upload",
+    "percent": "{{percent}}%",
+    "bytes": "{{done}} of {{total}}",
+    "bytesUnknown": "Transfer in progress"
+  },
+  "mods": {
+    "title": "Mods included",
+    "description": "Every top-level folder in the server's local mods directory, with its file count and size.",
+    "search": "Search mod folders…",
+    "name": "Folder",
+    "files": "Files",
+    "size": "Size",
+    "empty": "No mod folders found in the local mods directory.",
+    "noMatches": "No mod folders match your search.",
+    "filtered": "Showing {{shown}} of {{total}} mod folders."
+  },
+  "links": {
+    "title": "Share links",
+    "description": "The public VikingFile link works without a panel login.",
+    "empty": "Upload to VikingFile to get a public link. You can still copy the panel ZIP link.",
+    "footer": "The panel ZIP link needs a signed-in panel session and may only be reachable on this network. The VikingFile link is the one to share with players."
+  },
+  "toasts": {
+    "copyFailedTitle": "Could not copy",
+    "copyFailedFallback": "Your browser blocked clipboard access. Select the text and copy it manually.",
+    "downloadStartedTitle": "Export started",
+    "downloadStartedDesc": "Building the mods ZIP. The download will begin shortly.",
+    "uploadedTitle": "Upload complete",
+    "uploadedDesc": "Uploaded {{size}} of mods to VikingFile.",
+    "uploadedCachedDesc": "Reused the previous VikingFile upload because the mods folder has not changed.",
+    "uploadFailedTitle": "Upload failed",
+    "modsCopiedTitle": "Mod names copied",
+    "modsCopiedDesc": "All mod folder names were copied to the clipboard.",
+    "linkCopiedTitle": "Public link copied",
+    "linkCopiedDesc": "Share this VikingFile link with your players.",
+    "panelLinkCopiedTitle": "Panel link copied",
+    "panelLinkCopiedDesc": "This link needs a signed-in panel session."
+  },
+  "errors": {
+    "loadTitle": "Could not load the export preview",
+    "loadFallback": "The server's local mods folder could not be measured.",
+    "uploadFallback": "The mods ZIP could not be uploaded to VikingFile.",
+    "noPermissionTitle": "Read-only access",
+    "noPermission": "You can inspect this export, but only an admin or technician can download or upload it."
+  }
+}

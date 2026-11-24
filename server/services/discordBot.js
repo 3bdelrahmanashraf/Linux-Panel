@@ -1,0 +1,2830 @@
+import {
+  Client,
+  GatewayIntentBits,
+  SlashCommandBuilder,
+  REST,
+  Routes,
+  EmbedBuilder,
+  AttachmentBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ActivityType,
+  PermissionFlagsBits,
+  MessageFlags,
+  escapeMarkdown,
+} from "discord.js";
+import fs from "fs";
+import path from "path";
+import { request as undiciRequest, Headers as UndiciHeaders } from "undici";
+import { STATUS_CODES } from "http";
+import { types } from "util";
+import { createLogger } from "../utils/logger.js";
+const log = createLogger("Discord");
+import { getActiveServer, getSetting, setSetting } from "../database/init.js";
+import { loadUiSecret, writeUiSecretFile } from "../utils/uiSecretFile.js";
+import { sanitizeError } from "../utils/sanitize.js";
+import { describeStartFailure } from "./discordStartFailure.js";
+import { readIniValues } from "../utils/templateFiles.js";
+import { activeServerConfigDir, serverConfigDirRefusal } from "../utils/serverConfigPath.js";
+import { describeRefusal, logRefusalOnce } from "./zomboidDataPath.js";
+import { runManagedLifecycle } from "./managedContainer.js";
+import { resolveObservedServerRunning } from "../utils/serverStatus.js";
+import {
+  collectKnownSecretValues,
+  redactKnownSecrets,
+} from "../utils/discordMessageRedaction.js";
+import {
+  formatBytes,
+  getModsExportShareToken,
+  measureModsDir,
+} from "../utils/modsExport.js";
+import { ensureModsExportUpload } from "../utils/vikingfile.js";
+
+const DISCORD_OPERATION_TIMEOUT_MS = 30 * 1000;
+
+function withDiscordTimeout(operation, label = "operation") {
+  const promise = Promise.resolve(operation);
+  promise.catch(() => {});
+  let timeoutId;
+  const timeout = new Promise((_resolve, reject) => {
+    timeoutId = setTimeout(() => {
+      const error = new Error(
+        `Discord ${label} timed out after ${DISCORD_OPERATION_TIMEOUT_MS}ms (ETIMEDOUT)`,
+      );
+      error.code = "ETIMEDOUT";
+      reject(error);
+    }, DISCORD_OPERATION_TIMEOUT_MS);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    clearTimeout(timeoutId);
+  });
+}
+import {
+  acquireLifecycleLock,
+  lifecycleInProgressResponse,
+} from "./lifecycleCoordinator.js";
+
+// Workaround for undici 8.x + Node.js 22+/24+: undici adds Symbol(sensitiveHeaders)
+// to response header objects, but the WebIDL ByteString converter in undici's
+// Headers constructor throws on Symbol keys instead of skipping them (spec violation).
+// Provide a custom makeRequest that filters Symbol-keyed header properties before
+// constructing the Headers object.
+async function _resolveDiscordBody(body) {
+  if (body == null) return null;
+  if (typeof body === "string") return body;
+  if (types.isUint8Array(body)) return body;
+  if (types.isArrayBuffer(body)) return new Uint8Array(body);
+  if (body instanceof URLSearchParams) return body.toString();
+  if (body instanceof DataView) return new Uint8Array(body.buffer);
+  if (body instanceof Blob) return new Uint8Array(await body.arrayBuffer());
+  if (body instanceof FormData) return body;
+  if (body[Symbol.iterator]) return Buffer.concat([...body]);
+  if (body[Symbol.asyncIterator]) {
+    const chunks = [];
+    for await (const chunk of body) chunks.push(chunk);
+    return Buffer.concat(chunks);
+  }
+  throw new TypeError("Unable to resolve body.");
+}
+
+// hunt-wave6-2026-08-29 follow-up 1: this is THE boundary every outbound
+// Discord API call passes through -- channel.send(), interaction.reply()/
+// editReply(), slash-command registration, everything -- because it's wired
+// as the REST transport for the Client itself (see the `rest.makeRequest`
+// option in start()) and for every other manually-created REST instance in
+// this file. Redacting known secret VALUES here, rather than inside
+// handleRcon() or any other individual sender, means the guard covers the
+// success branch, the failure branch, and any future sender nobody has
+// written yet -- see utils/discordMessageRedaction.js's header for the full
+// reasoning (exact-value match, not a shape heuristic).
+async function _safeDiscordMakeRequest(url, init) {
+  let body = await _resolveDiscordBody(init.body);
+  if (typeof body === "string" && body) {
+    try {
+      const secrets = await collectKnownSecretValues();
+      body = redactKnownSecrets(body, secrets);
+    } catch (err) {
+      // Never let a secrets lookup failure block a send outright, but never
+      // send the ORIGINAL unredacted body either if redaction couldn't run --
+      // that would silently reopen exactly the leak this exists to close.
+      log.error(`Discord outbound redaction check failed, blocking this send: ${err.message}`);
+      throw err;
+    }
+  }
+  const res = await undiciRequest(url, {
+    ...init,
+    body,
+  });
+  return {
+    body: res.body,
+    arrayBuffer: () => res.body.arrayBuffer(),
+    json: () => res.body.json(),
+    text: () => res.body.text(),
+    get bodyUsed() {
+      return res.body.bodyUsed;
+    },
+    // Object.entries() only yields string-keyed enumerable properties, filtering
+    // out Symbol(sensitiveHeaders) and other Symbol keys that cause the TypeError.
+    headers: new UndiciHeaders(Object.fromEntries(Object.entries(res.headers))),
+    status: res.statusCode,
+    statusText: STATUS_CODES[res.statusCode] ?? "",
+    ok: res.statusCode >= 200 && res.statusCode < 300,
+  };
+}
+
+async function _resolveDiscordApplicationId(token) {
+  if (!token) return null;
+
+  const response = await fetch("https://discord.com/api/v10/users/@me", {
+    headers: {
+      Authorization: `Bot ${token}`,
+    },
+    signal: AbortSignal.timeout(10000),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Discord identity lookup failed (${response.status})`);
+  }
+
+  const user = await response.json();
+  return typeof user?.id === "string" && user.id ? user.id : null;
+}
+
+// PZ chat channels that are public to every player on the server. Faction,
+// safehouse, radio, admin and whisper channels are deliberately absent: they
+// are private in game and must stay private in Discord.
+const PUBLIC_CHAT_TYPES = new Set([
+  "General",
+  "Say",
+  "Local",
+  "Shout",
+  "Server Alert",
+  "Server chat",
+]);
+const NO_YELL_CHAT_TYPES = new Set(
+  [...PUBLIC_CHAT_TYPES].filter((t) => t !== "Shout"),
+);
+const GENERAL_ONLY_CHAT_TYPES = new Set(["General"]);
+const CHAT_RELAY_SCOPES = new Set(["public", "no-yell", "general"]);
+
+export function normalizeChatRelayScope(value) {
+  return CHAT_RELAY_SCOPES.has(value) ? value : "public";
+}
+
+export function allowedChatTypesForScope(scope) {
+  if (scope === "general") return GENERAL_ONLY_CHAT_TYPES;
+  if (scope === "no-yell") return NO_YELL_CHAT_TYPES;
+  return PUBLIC_CHAT_TYPES;
+}
+
+// Default permission levels for each command
+// 'everyone' = no role needed, 'moderator' = mod or admin role, 'admin' = admin role only
+const DEFAULT_COMMAND_PERMISSIONS = {
+  status: "everyone",
+  players: "everyone",
+  mods: "everyone",
+  save: "moderator",
+  broadcast: "moderator",
+  kick: "moderator",
+  start: "admin",
+  stop: "admin",
+  restart: "admin",
+  rcon: "admin",
+};
+
+const COMMAND_TIERS = new Set(["everyone", "moderator", "admin"]);
+
+// SECURITY (2026-10-05, HT4a): one reading of a command's tier. A stored
+// tier that is missing, empty or not a tier read as "admin" in
+// checkPermission() and getCommands() but as the default in resetConfig(),
+// so a wipe by someone without that command's capability "reset" an
+// effectively admin-only /kick to "moderator" -- the D1 rule only keeps a
+// tier that differs from the default. Every reader now goes through this,
+// and loadConfig() and updateCommandPermissions() store the result
+// (normalizeCommandPermissions()), so all of them see "admin": the
+// stricter reading.
+export function commandTierOf(permissions, command) {
+  const tier = permissions?.[command];
+  return COMMAND_TIERS.has(tier) ? tier : "admin";
+}
+
+// Commands that DEFAULT_COMMAND_PERMISSIONS gained in a release AFTER the one
+// that first wrote a stored tier object. Such an object simply has no key for
+// them. That is a different thing from a damaged save: a key that IS present
+// but empty or not a tier still reads as "admin" (commandTierOf). Without
+// this list the fail-closed reading would pin a brand-new command whose
+// default is looser than "admin" -- e.g. /mods, "everyone" -- to admin-only
+// on every install that upgraded, silently withholding it (the tier the
+// settings page shows would differ from the default every test asserts).
+// Add a command here in the release that introduces it.
+const COMMAND_TIERS_ADDED_LATER = ["mods"];
+
+// Every command's tier from a stored object: its own valid tier, else
+// "admin" (also for every command when the object can't be read). With
+// nothing stored at all, loadConfig() keeps the defaults instead. Every
+// release has written all valid tiers, so a saved setup reads exactly as
+// before -- except a command added by a later release (see
+// COMMAND_TIERS_ADDED_LATER): a readable object saved before it existed
+// gives it its own default rather than the fail-closed "admin".
+export function normalizeCommandPermissions(stored) {
+  const readable =
+    Boolean(stored) && typeof stored === "object" && !Array.isArray(stored);
+  const source = readable ? stored : {};
+  const normalized = Object.fromEntries(
+    Object.keys(DEFAULT_COMMAND_PERMISSIONS).map((command) => [
+      command,
+      commandTierOf(source, command),
+    ]),
+  );
+  if (readable) {
+    for (const command of COMMAND_TIERS_ADDED_LATER) {
+      if (!(command in source)) {
+        normalized[command] = DEFAULT_COMMAND_PERMISSIONS[command];
+      }
+    }
+  }
+  return normalized;
+}
+
+const LIFECYCLE_DEDUPE_WINDOW_MS = 60_000;
+const PLAYER_PRESENCE_INTERVAL_MS = 60_000;
+
+// Editable "Playing ..." presence text, one per server state the bot can
+// observe. Keys mirror the branches in updatePlayerPresence(); {count} and
+// {max} are substituted for the online/total-slots states. The defaults
+// reproduce the wording the bot shipped with before these were editable, so
+// an operator who never opens the card sees exactly the old behaviour.
+export const DEFAULT_PRESENCE_TEXTS = Object.freeze({
+  offline: "Server offline",
+  unknown: "Status unknown",
+  players: "{count}/{max}",
+  playersNoMax: "{count} online",
+  unavailable: "Players unavailable",
+});
+
+// Discord presence text is public and short; cap it the same way event
+// templates are capped so a pasted novel can't blow up the payload, and fall
+// back to the default when a field is blank (an empty activity would show
+// nothing at all, which is worse than the shipped wording).
+const PRESENCE_TEMPLATE_MAX_LEN = 128;
+
+export function normalizePresenceTexts(value) {
+  const stored =
+    value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const normalized = {};
+  for (const [key, fallback] of Object.entries(DEFAULT_PRESENCE_TEXTS)) {
+    const raw = stored[key];
+    normalized[key] =
+      typeof raw === "string" && raw.trim()
+        ? raw.slice(0, PRESENCE_TEMPLATE_MAX_LEN)
+        : fallback;
+  }
+  return normalized;
+}
+// How long a gateway reconnect must persist before getStatus() reports it —
+// well above the ~2-3s a real RESUME took in
+// server/tests/linuxDiscordGatewayResilience.test.js, so a routine blip
+// self-heals silently and only a genuinely stuck reconnect (or a permanent
+// shardDisconnect, which never clears on its own) reaches the operator.
+const GATEWAY_DEGRADED_THRESHOLD_MS = 30_000;
+// How often _sendToChannel() repeats its warning for a channel it keeps
+// refusing because it isn't in the configured guild (M2): game chat would
+// otherwise log one per chat line.
+const OUTSIDE_GUILD_WARN_INTERVAL_MS = 10 * 60 * 1000;
+
+// start()'s distinguishable return for "a DIFFERENT start() call is already
+// in flight, this call was a no-op" (its _starting guard, re-entrancy sweep
+// finding #1). Truthy like the plain `true` success return -- POST
+// /discord/start's existing `if (started)` still reads it as success with
+// no code change needed there, since the bot genuinely is (or is about to
+// be) running either way -- but PUT /config's credential-change branch can
+// tell it apart from a real reconnect it just performed itself, so it does
+// not claim credit for a reconnect this request never attempted.
+export const START_ALREADY_IN_PROGRESS = Symbol(
+  "discord-start-already-in-progress",
+);
+
+export class DiscordBot {
+  constructor(rconService, serverManager, scheduler, logTailer = null) {
+    this.client = null;
+    this.rconService = rconService;
+    this.serverManager = serverManager;
+    this.scheduler = scheduler;
+    this.logTailer = logTailer;
+    this.token = null;
+    this.guildId = null;
+    this.adminRoleId = null;
+    this.modRoleId = null;
+    this.channelId = null;
+    this.isRunning = false;
+    // Claimed synchronously at the top of start(), released in a finally --
+    // see start()'s own comment for the double-start race this closes.
+    this._starting = false;
+    // Claimed synchronously at the top of stop(), released once it's done --
+    // see the 'shardDisconnect' handler's own comment (round 19) for the
+    // race this closes: an intentional stop() calls client.destroy(), which
+    // itself closes the gateway and can fire 'shardDisconnect' before
+    // stop() reaches its own `this.isRunning = false`. Without this flag
+    // that in-flight event would be indistinguishable from a genuine
+    // unrecoverable disconnect (revoked token, disallowed intents, ...) and
+    // stamp a misleading "Invalid token" lastStartError over what was
+    // actually a clean, deliberate stop.
+    this._stopping = false;
+    // Last start() failure, surfaced through routes/discord.js so a bad
+    // token, disallowed privileged intents, and a network timeout stop
+    // wearing the same "check configuration" message. Same pattern as
+    // DockerClient.lastError.
+    this.lastStartError = null;
+    // Serializes PUT /config, /webhook-events, and /permissions (all three
+    // read this singleton's current persisted config and write back a
+    // merge) against each other -- re-entrancy sweep finding #5, same
+    // promise-chain-mutex shape as AuthService._withMutex
+    // (services/auth.js) and permissions.js's withRoleMutex. Without this,
+    // two overlapping saves each read a not-yet-committed value and the
+    // second write clobbers a field the first one just changed; it also
+    // means PUT /config's own stop()+start() reconnect sequence runs to
+    // completion before a second concurrent /config save can begin its
+    // own, closing the specific compounding race with finding #1 (two
+    // overlapping start() calls) that motivated start()'s _starting guard.
+    this._configMutex = Promise.resolve();
+    // Optional observer: (eventType, variables) => void, set by index.js so
+    // SMS notifications receive the same events as Discord. See
+    // sendEventNotification().
+    this.eventObserver = null;
+    this.webhookEvents = {};
+    this.commandPermissions = { ...DEFAULT_COMMAND_PERMISSIONS };
+    this.chatRelayEnabled = true;
+    this.chatRelayChannelId = null; // null = use main channelId
+    this.chatRelayScope = "public"; // 'public' = all open channels, 'general' = General tab only
+    // Where /mods posts its export message. null = use the notification
+    // channel (this.channelId), the same fallback the chat relay uses.
+    this.modsExportChannelId = null;
+    // Optional public base URL for the /mods download link (e.g.
+    // "https://panel.example.com"). null = derive it from the panel's own
+    // LAN address and port, which only works for clients that can reach it.
+    this.modsExportBaseUrl = null;
+    this._presenceInterval = null;
+    this._presenceUpdateInFlight = null;
+    // Editable activity/"Playing" text per server state (see
+    // DEFAULT_PRESENCE_TEXTS). Refreshed from the DB in loadConfig().
+    this.presence = { ...DEFAULT_PRESENCE_TEXTS };
+    // Last time a "*** SERVER STARTED ***" marker fired the Server Joinable
+    // notification, so a log re-read (rotation/re-resolve) can't double-send.
+    this._lastJoinableAt = 0;
+
+    // Notification circuit breaker — avoids log/network spam when Discord
+    // is unreachable (DNS failures, transient outages). After N consecutive
+    // failures we open the circuit for COOLDOWN_MS and drop sends silently.
+    // Tracked per channel: a chat relay pointed at a deleted channel must not
+    // silence server notifications going to a perfectly healthy one.
+    this._channelBreakers = new Map(); // channelId -> {failures, openUntil, suppressed}
+    // Channels _sendToChannel() last refused because they aren't in the
+    // configured guild (M2), for its throttled warning and for POST
+    // /test-message's reason. Dropped at the channel's next send that isn't
+    // refused.
+    this._outsideGuildRefusals = new Map(); // channelId -> {channelGuildId, configuredGuildId, warnedAt, since}
+
+    // hunt-wave6-2026-08-29 suspect 6: getStatus() used to have no field at
+    // all for gateway health, so a real (self-healing) heartbeat black hole
+    // or a permanent (unrecoverable) shard disconnect both left `running`
+    // reporting true throughout — an operator watching the page saw a
+    // healthy bot while alerting was actually down, the same gap already
+    // fixed for panel update checks. Set on 'shardReconnecting' (any
+    // recoverable close, including a zombie connection @discordjs/ws just
+    // detected) and 'shardDisconnect' (unrecoverable — never coming back on
+    // its own); cleared on 'shardResume' (session preserved) or 'shardReady'
+    // (a fresh IDENTIFY succeeded). getStatus() debounces this against
+    // GATEWAY_DEGRADED_THRESHOLD_MS before surfacing it — a routine RESUME
+    // measured at ~2-3s in server/tests/linuxDiscordGatewayResilience.test.js
+    // must not flip this on every blip, or the signal trains the operator to
+    // ignore it, which is worse than no signal at all.
+    this._gatewayDegradedSince = null;
+
+    // Lifecycle dedupe — serverStart/serverStop webhooks can be triggered
+    // from several paths (HTTP /start /stop /force-stop, Discord slash
+    // commands, the status watchdog, RCON-disconnect detection). Track the
+    // last fired state so duplicate observations within a short window only
+    // send one webhook. A missed opposite transition must not suppress future
+    // real lifecycle notifications forever.
+    this._lastLifecycleState = null; // 'running' | 'stopped' | null
+    this._lastLifecycleAt = 0;
+    this._lifecycleNotificationChain = Promise.resolve();
+    this._lifecycleNotificationGeneration = 0;
+
+    // Throttles the "game server unreachable" reply so a busy Discord channel
+    // gets told once rather than once per message.
+    this._bridgeOfflineNoticeAt = 0;
+
+    // Serialise registerCommands() — it can be invoked from start() and
+    // from updateCommandPermissions() at roughly the same time on a fresh
+    // boot; without a lock the two REST.put() calls race and either set
+    // can win, leaving Discord in an inconsistent state.
+    this._registerInFlight = null;
+
+    // Remember the last guildId we registered commands for so that
+    // changing guilds via updateConfig() can clean up the OLD guild's
+    // commands instead of leaving them ghosted forever.
+    this._registeredGuildId = null;
+
+    // Hold onto the chatMessage listener as a bound reference so we can
+    // off() it during stop(). An inline arrow would be anonymous and leak.
+    this._onGameChat = null;
+    this._chatRelayChain = Promise.resolve();
+    this._chatRelayPending = 0;
+    this._chatRelayDropped = 0;
+    this._chatRelayGeneration = 0;
+
+    // Setup Chat Bridge listener
+    if (this.logTailer) {
+      this._onGameChat = (data) => this._queueGameChat(data);
+      this.logTailer.on("chatMessage", this._onGameChat);
+      // The server console's own "*** SERVER STARTED ***" marker drives the
+      // "Server Joinable" notification (see _handleServerStarted). Kept as a
+      // named handler like _onGameChat so it can be detached on stop without
+      // leaking across bot lifecycles.
+      this._onServerStarted = () => this._handleServerStarted();
+      this.logTailer.on("serverStarted", this._onServerStarted);
+    }
+  }
+
+  // "*** SERVER STARTED ***" landed in server-console.txt: the world is
+  // loaded and players can connect. Fires the "Server Joinable" event. The
+  // duplicate guard (covers this marker being re-read by a log rotation or a
+  // re-resolve, and the RCON startup sequence firing the same event seconds
+  // apart) lives in _sendEventNotification() at the single send point.
+  _handleServerStarted() {
+    this.sendEventNotification("serverJoinable", {}).catch((err) =>
+      log.debug(`Discord serverJoinable notification failed: ${err.message}`),
+    );
+  }
+
+  // Relay sends are chained so Discord shows messages in the order the game
+  // logged them — parallel channel.send() calls routinely land out of order.
+  // The queue is capped: if Discord is slower than the server's chat, dropping
+  // is better than relaying an ever-growing backlog of stale messages.
+  _queueGameChat(data) {
+    const MAX_PENDING = 40;
+    if (this._chatRelayPending >= MAX_PENDING) {
+      this._chatRelayDropped++;
+      if (this._chatRelayDropped % 25 === 1) {
+        log.warn(
+          `Chat relay is behind (${this._chatRelayPending} queued) — dropped ${this._chatRelayDropped} message(s) so far`,
+        );
+      }
+      return;
+    }
+    const generation = this._chatRelayGeneration;
+    this._chatRelayPending++;
+    this._chatRelayChain = this._chatRelayChain
+      .then(() => {
+        if (generation !== this._chatRelayGeneration) return;
+        return this.handleGameChat(data);
+      })
+      .catch((e) => log.debug(`Game chat relay failed: ${e.message}`))
+      .finally(() => {
+        if (generation !== this._chatRelayGeneration) return;
+        this._chatRelayPending--;
+        if (this._chatRelayPending === 0 && this._chatRelayDropped > 0) {
+          log.info(
+            `Chat relay caught up — ${this._chatRelayDropped} message(s) were dropped while behind`,
+          );
+          this._chatRelayDropped = 0;
+        }
+      });
+  }
+
+  async handleGameChat(data) {
+    if (!this.chatRelayEnabled || !this.isRunning || !this.client) return;
+
+    // B42 records ordinary talking as Say/Local and Q shouts as Shout, so
+    // filtering down to the General tab silences almost every real message.
+    const allowed = allowedChatTypesForScope(this.chatRelayScope);
+    if (data?.sourceChatType) {
+      if (!allowed.has(data.sourceChatType)) return;
+    } else if (this.chatRelayScope === "general") {
+      if (data?.type !== "general") return;
+    } else if (data?.type !== "general" && data?.type !== "server") {
+      return;
+    }
+
+    // Discord messages reach PZ through RCON as "[Discord] user: message".
+    // The server logs that broadcast as chat, so relaying it back would create
+    // an immediate duplicate in the originating Discord channel.
+    if (String(data?.message || "").startsWith("[Discord] ")) return;
+
+    // The scheduler's restart countdown ticks as often as once a second near
+    // the end — those are aimed at players in game and would flood the relay.
+    // The restart's actual outcome (it's happening now, or it was called off)
+    // is exactly what players watching Discord expect to see, so those two
+    // are let through instead of being silently swallowed with the rest.
+    const serverMsg = String(data?.message || "");
+    if (data?.type === "server" && serverMsg.startsWith("[SERVER] ")) {
+      const isOutcome =
+        serverMsg.includes("RESTARTING NOW") || serverMsg.includes("CANCELLED");
+      if (!isOutcome) return;
+    }
+
+    // Use dedicated chat relay channel if set, otherwise fall back to main channel
+    const targetChannelId = this.chatRelayChannelId || this.channelId;
+    if (!targetChannelId) return;
+    log.debug(
+      `Relaying game chat from ${data?.author || "unknown"} to Discord`,
+    );
+
+    // maskedLink is off by default, and it is the one that turns a player's
+    // chat line into a clickable link pointing anywhere.
+    const cleanMessage = escapeMarkdown(
+      String(data.message || "")
+        .replace(/@everyone/g, "(everyone)")
+        .replace(/@here/g, "(here)")
+        .slice(0, 1850),
+      { maskedLink: true },
+    );
+    const cleanAuthor = escapeMarkdown(
+      String(data.author || "unknown")
+        .replace(/[\r\n]+/g, " ")
+        .slice(0, 80),
+      { maskedLink: true },
+    );
+    await this._sendToChannel(
+      targetChannelId,
+      `**<${cleanAuthor}>** ${cleanMessage}`,
+      { label: "game chat relay" },
+    );
+  }
+
+  // Run a critical section serialized against other config-mutex holders.
+  // Same shape as AuthService._withMutex (services/auth.js).
+  withConfigMutex(fn) {
+    const run = this._configMutex.then(fn, fn);
+    this._configMutex = run.then(
+      () => {},
+      () => {},
+    );
+    return run;
+  }
+
+  async loadConfig() {
+    log.info("Loading Discord bot config...");
+    // discordBotToken lives in its own file now, not db.json — see
+    // utils/uiSecretFile.js. legacyValue migrates a pre-upgrade value
+    // verbatim on first load; every restart after that reads the file.
+    this.token = await loadUiSecret("discordBotToken", {
+      legacyValue: await getSetting("discordBotToken"),
+      clearLegacy: () => setSetting("discordBotToken", null),
+      log,
+    });
+    this.guildId = await getSetting("discordGuildId");
+    this.adminRoleId = await getSetting("discordAdminRoleId");
+    this.modRoleId = await getSetting("discordModRoleId");
+    this.channelId = await getSetting("discordChannelId");
+
+    // Load command permissions. HT4a: through normalizeCommandPermissions(),
+    // so a missing or broken tier reads as "admin" everywhere; a stored
+    // value that can't be parsed used to read as every default.
+    const savedPerms = await getSetting("discordCommandPermissions");
+    if (savedPerms) {
+      let parsed = null;
+      try {
+        parsed =
+          typeof savedPerms === "string" ? JSON.parse(savedPerms) : savedPerms;
+      } catch (e) {
+        log.warn(`Stored Discord command tiers can't be read, so every command is admin-only: ${e.message}`);
+      }
+      this.commandPermissions = normalizeCommandPermissions(parsed);
+    }
+
+    // Load chat relay settings
+    const chatRelayEnabled = await getSetting("discordChatRelayEnabled");
+    this.chatRelayEnabled = chatRelayEnabled !== false; // default true
+    this.chatRelayChannelId =
+      (await getSetting("discordChatRelayChannelId")) || null;
+    this.chatRelayScope = normalizeChatRelayScope(
+      await getSetting("discordChatRelayScope"),
+    );
+
+    // Load the /mods export settings. Both optional: an unset channel falls
+    // back to the notification channel, an unset base URL is derived from the
+    // panel's own address when a link is built.
+    this.modsExportChannelId =
+      (await getSetting("discordModsExportChannelId")) || null;
+    this.modsExportBaseUrl =
+      (await getSetting("discordModsExportBaseUrl")) || null;
+
+    // Load webhook events
+    const savedEvents = await getSetting("discordWebhookEvents");
+    this.webhookEvents = {};
+    if (savedEvents) {
+      try {
+        const parsed =
+          typeof savedEvents === "string"
+            ? JSON.parse(savedEvents)
+            : savedEvents;
+        // Guard against `null` (valid JSON) and non-object payloads — otherwise
+        // `this.webhookEvents[eventType]` later would throw a TypeError.
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          this.webhookEvents = parsed;
+        }
+      } catch (e) {
+        log.warn(`Failed to parse saved webhookEvents: ${e.message}`);
+      }
+    }
+
+    // Load editable presence/activity texts (stored as a JSON string, the
+    // same shape as webhookEvents above).
+    const savedPresence = await getSetting("discordPresence");
+    let parsedPresence = null;
+    if (savedPresence) {
+      try {
+        parsedPresence =
+          typeof savedPresence === "string"
+            ? JSON.parse(savedPresence)
+            : savedPresence;
+      } catch (e) {
+        log.warn(`Failed to parse saved Discord presence texts: ${e.message}`);
+      }
+    }
+    this.presence = normalizePresenceTexts(parsedPresence);
+  }
+
+  async saveWebhookEvents(events) {
+    this.webhookEvents = events;
+    await setSetting("discordWebhookEvents", JSON.stringify(events));
+  }
+
+  // Persist the editable activity texts and hot-apply them to the live
+  // presence so a save is reflected within one update tick, not one interval.
+  async updatePresence(presence) {
+    this.presence = normalizePresenceTexts(presence);
+    await setSetting("discordPresence", JSON.stringify(this.presence));
+    if (this.isRunning) {
+      await this.updatePlayerPresence();
+    }
+    return this.presence;
+  }
+
+  // Renders a notification template exactly the way the live event path does:
+  //
+  //   - Single-pass substitution: builds one regex over all known variable
+  //     names and uses a callback so that values containing $1, $&, etc. are
+  //     NOT interpreted as regex backrefs, and replacement order doesn't
+  //     matter (no risk of {player} clobbering the start of {playerCount}).
+  //   - undefined/null/object values render as an empty string.
+  //   - Only the SUBSTITUTED VALUE is markdown-escaped, never the template
+  //     itself. Player names (Steam names can contain backticks, asterisks,
+  //     underscores, ...) used to be substituted verbatim and could break a
+  //     notification's formatting; escaping the value preserves an operator's
+  //     own intentional markdown (e.g. "**{player}** has joined").
+  //   - @everyone / @here are neutralised so a player-supplied value can't
+  //     ping the whole server, and the message is capped at 1900 chars.
+  //
+  // Exposed (not private) so the API's "test this event" route renders a
+  // byte-for-byte identical message to what the live path would send.
+  renderEventMessage(template, variables = {}) {
+    if (typeof template !== "string") return "";
+    let message = template;
+    const keys = Object.keys(variables || {});
+    if (keys.length > 0) {
+      const escaped = keys.map((k) => k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+      const re = new RegExp(`\\{(${escaped.join("|")})\\}`, "g");
+      message = message.replace(re, (_, k) => {
+        const v = variables[k];
+        if (v === undefined || v === null) return "";
+        return escapeMarkdown(typeof v === "string" ? v : String(v), {
+          maskedLink: true,
+        });
+      });
+    }
+
+    return message
+      .replace(/@everyone/g, "(everyone)")
+      .replace(/@here/g, "(here)")
+      .slice(0, 1900);
+  }
+
+  async sendEventNotification(eventType, variables = {}) {
+    // Observer hook for parallel notification sinks (SMS), attached in
+    // server/index.js. Deliberately before the isRunning/channel early
+    // returns below: SMS must keep working when the Discord bot is disabled
+    // or has no configured channel, which is the common case. Fire-and-
+    // forget and fully isolated so an SMS failure can never break Discord.
+    if (typeof this.eventObserver === "function") {
+      try {
+        this.eventObserver(eventType, variables);
+      } catch {
+        /* observer must never throw into the Discord path */
+      }
+    }
+
+    const isLifecycle =
+      eventType === "serverStart" || eventType === "serverStop";
+    if (!isLifecycle) {
+      return this._sendEventNotification(eventType, variables);
+    }
+
+    const generation = this._lifecycleNotificationGeneration;
+    const run = this._lifecycleNotificationChain.then(
+      () => this._sendEventNotification(eventType, variables, generation),
+      () => this._sendEventNotification(eventType, variables, generation),
+    );
+    this._lifecycleNotificationChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  async _sendEventNotification(
+    eventType,
+    variables = {},
+    generation = this._lifecycleNotificationGeneration,
+  ) {
+    const isLifecycle =
+      eventType === "serverStart" || eventType === "serverStop";
+    if (isLifecycle && generation !== this._lifecycleNotificationGeneration) {
+      return false;
+    }
+    if (!this.isRunning || !this.channelId) return;
+
+    // Dedupe lifecycle transitions — these events can fire from multiple
+    // code paths for the same real state change (HTTP route + watchdog +
+    // RCON-disconnect handler all observe the same stop, etc.).
+    let newState = null;
+    if (isLifecycle) {
+      newState = eventType === "serverStart" ? "running" : "stopped";
+      if (
+        this._lastLifecycleState === newState &&
+        Date.now() - this._lastLifecycleAt < LIFECYCLE_DEDUPE_WINDOW_MS
+      ) {
+        return; // already notified for this transition
+      }
+    }
+
+    // "Server Joinable" has two independent triggers -- the game console's own
+    // "*** SERVER STARTED ***" marker (logTailer's 'serverStarted' event) and
+    // the RCON startup sequence in routes/server.js once the port answers.
+    // Both normally land within seconds of each other, so dedupe here at the
+    // single send point: without it, enabling the event produced two identical
+    // "Server Started / joinable" messages per boot. Committed even when the
+    // event is disabled, so enabling it later can't replay a stale transition.
+    if (eventType === "serverJoinable") {
+      const now = Date.now();
+      if (now - this._lastJoinableAt < LIFECYCLE_DEDUPE_WINDOW_MS) return;
+      this._lastJoinableAt = now;
+    }
+
+    const event = this.webhookEvents[eventType];
+    if (!event || !event.enabled || typeof event.template !== "string") {
+      // Update dedupe state even when the event is disabled — otherwise
+      // enabling the event later would replay the historical transition.
+      if (isLifecycle) {
+        this._lastLifecycleState = newState;
+        this._lastLifecycleAt = Date.now();
+      }
+      return;
+    }
+
+    // Rendering (markdown escaping of substituted values, mention
+    // neutralisation, length cap) lives in renderEventMessage() so the API's
+    // on-demand event tester produces exactly what this path would send.
+    const message = this.renderEventMessage(event.template, variables);
+
+    // A template that renders to nothing would be rejected by Discord and
+    // counted as a channel failure, eventually suppressing every notification.
+    if (!message.trim()) {
+      log.warn(`Skipping ${eventType} notification: template rendered empty`);
+      if (isLifecycle) {
+        this._lastLifecycleState = newState;
+        this._lastLifecycleAt = Date.now();
+      }
+      return;
+    }
+
+    const sent = await this.sendNotification(message);
+    // Only commit lifecycle dedupe state on a successful send. If the send
+    // failed (circuit open, missing perms, channel deleted), keep the old
+    // state so the next attempt isn't suppressed.
+    if (isLifecycle && generation === this._lifecycleNotificationGeneration && sent) {
+      this._lastLifecycleState = newState;
+      this._lastLifecycleAt = Date.now();
+    }
+  }
+
+  async updateConfig(token, guildId, adminRoleId, channelId, modRoleId) {
+    writeUiSecretFile("discordBotToken", token);
+    await setSetting("discordGuildId", guildId);
+    // adminRoleId normalized the same way modRoleId already is, both here
+    // and below -- without this, this.adminRoleId was stored RAW forever
+    // (never normalized, not even after this same function ran once), so
+    // once an empty adminRoleId had ever been saved, rolesChanged compared
+    // "" !== null on every subsequent unrelated config save and spuriously
+    // re-registered Discord slash commands every time.
+    await setSetting("discordAdminRoleId", adminRoleId || "");
+    await setSetting("discordModRoleId", modRoleId || "");
+    await setSetting("discordChannelId", channelId || "");
+
+    const previousGuildId = this.guildId;
+    const previousToken = this.token;
+    const rolesChanged =
+      this.adminRoleId !== (adminRoleId || null) ||
+      this.modRoleId !== (modRoleId || null);
+    this.token = token;
+    this.guildId = guildId;
+    this.adminRoleId = adminRoleId || null;
+    this.modRoleId = modRoleId || null;
+    this.channelId = channelId;
+
+    // If we changed guilds and the bot is currently running, clean up the
+    // old guild's command list — otherwise the old guild keeps showing
+    // ghost slash commands forever.
+    if (
+      this.isRunning &&
+      this.client?.user &&
+      previousGuildId &&
+      previousGuildId !== guildId
+    ) {
+      try {
+        const rest = new REST({
+          version: "10",
+          makeRequest: _safeDiscordMakeRequest,
+        }).setToken(previousToken || this.token);
+        await withDiscordTimeout(
+          rest.put(
+            Routes.applicationGuildCommands(this.client.user.id, previousGuildId),
+            { body: [] },
+          ),
+          "old guild command cleanup",
+        );
+        log.info(
+          `Cleared slash commands from previous guild ${previousGuildId}`,
+        );
+      } catch (e) {
+        log.warn(
+          `Failed to clear commands from previous guild ${previousGuildId}: ${e.message}`,
+        );
+      }
+      this._registeredGuildId = null;
+    }
+
+    // Command visibility depends on which roles are configured, so a role
+    // change has to be pushed back to Discord.
+    if (rolesChanged && this.isRunning && this.client?.user) {
+      try {
+        await this.registerCommands();
+      } catch (e) {
+        log.warn(`Failed to re-register commands after role change: ${e.message}`);
+      }
+    }
+  }
+
+  async updateChatRelay(enabled, channelId, scope) {
+    this.chatRelayEnabled = enabled;
+    this.chatRelayChannelId = channelId || null;
+    this.chatRelayScope = normalizeChatRelayScope(scope);
+    await setSetting("discordChatRelayEnabled", enabled);
+    await setSetting("discordChatRelayChannelId", channelId || "");
+    await setSetting("discordChatRelayScope", this.chatRelayScope);
+  }
+
+  // Persist the /mods export settings. An empty channel clears it back to
+  // the notification channel (the same fallback the chat relay uses). The
+  // base URL is only used to build the download link; an empty one means
+  // "derive the panel's own address", so it is stored trimmed without a
+  // trailing slash to avoid a double slash in the link.
+  async updateModsExportConfig({ channelId, baseUrl }) {
+    if (channelId !== undefined) {
+      this.modsExportChannelId = channelId || null;
+      await setSetting("discordModsExportChannelId", channelId || "");
+    }
+    if (baseUrl !== undefined) {
+      const trimmed = String(baseUrl || "").trim().replace(/\/+$/, "");
+      this.modsExportBaseUrl = trimmed || null;
+      await setSetting("discordModsExportBaseUrl", trimmed);
+    }
+    return {
+      modsExportChannelId: this.modsExportChannelId,
+      modsExportBaseUrl: this.modsExportBaseUrl,
+    };
+  }
+
+  // SECURITY (2026-10-05, D1): command tiers survive a wipe. Only the
+  // commands named in `commandTiersToReset` go back to their default tier;
+  // routes/discord.js's POST /reset names the ones whose tier the caller
+  // could change through PUT /permissions anyway. A wipe used to put every
+  // tier back to its default, so someone without players.moderate could
+  // undo an admin raising /kick to "admin": once the bot was set up again,
+  // mod-role holders could kick players. Naming nothing keeps every tier.
+  // Returns the commands that kept a tier other than their default.
+  async resetConfig({ commandTiersToReset = [] } = {}) {
+    const token = this.token;
+    const guildId = this.guildId;
+
+    if (token && guildId) {
+      try {
+        const applicationId =
+          this.client?.user?.id || (await _resolveDiscordApplicationId(token));
+
+        if (applicationId) {
+          const rest = new REST({
+            version: "10",
+            makeRequest: _safeDiscordMakeRequest,
+          }).setToken(token);
+          await withDiscordTimeout(
+            rest.put(
+              Routes.applicationGuildCommands(applicationId, guildId),
+              { body: [] },
+            ),
+            "command reset",
+          );
+          log.info(`Cleared slash commands from guild ${guildId}`);
+        }
+      } catch (error) {
+        log.warn(
+          `Failed to clear slash commands during Discord reset: ${error.message}`,
+        );
+      }
+    }
+
+    if (this.isRunning) {
+      await this.stop();
+    }
+
+    const commandPermissions = {};
+    const keptCommandPermissions = [];
+    for (const [command, defaultTier] of Object.entries(
+      DEFAULT_COMMAND_PERMISSIONS,
+    )) {
+      const currentTier = commandTierOf(this.commandPermissions, command);
+      if (commandTiersToReset.includes(command) || currentTier === defaultTier) {
+        commandPermissions[command] = defaultTier;
+      } else {
+        commandPermissions[command] = currentTier;
+        keptCommandPermissions.push(command);
+      }
+    }
+
+    writeUiSecretFile("discordBotToken", "");
+    await setSetting("discordGuildId", "");
+    await setSetting("discordAdminRoleId", "");
+    await setSetting("discordModRoleId", "");
+    await setSetting("discordChannelId", "");
+    // HT4c: auto-start and the chat relay go back to what a fresh install
+    // reads (both on; the relay in the notification channel, public chat),
+    // not off -- the wipe dialog says so in those words. Neither does
+    // anything until someone enters a token again, which needs every
+    // command's capability, server.world_events (the relay's) among them.
+    await setSetting("discordAutoStart", true);
+    await setSetting("discordChatRelayEnabled", true);
+    await setSetting("discordChatRelayChannelId", "");
+    await setSetting("discordChatRelayScope", "public");
+    await setSetting("discordModsExportChannelId", "");
+    await setSetting("discordModsExportBaseUrl", "");
+    await setSetting(
+      "discordCommandPermissions",
+      JSON.stringify(commandPermissions),
+    );
+    await setSetting("discordWebhookEvents", JSON.stringify({}));
+    await setSetting("discordPresence", JSON.stringify(DEFAULT_PRESENCE_TEXTS));
+
+    this.token = null;
+    this.guildId = null;
+    this.adminRoleId = null;
+    this.modRoleId = null;
+    this.channelId = null;
+    this.webhookEvents = {};
+    this.commandPermissions = commandPermissions;
+    this.chatRelayEnabled = true;
+    this.chatRelayChannelId = null;
+    this.chatRelayScope = "public";
+    this.modsExportChannelId = null;
+    this.modsExportBaseUrl = null;
+    this.presence = { ...DEFAULT_PRESENCE_TEXTS };
+    this._registeredGuildId = null;
+    this._channelBreakers.clear();
+    this._outsideGuildRefusals.clear();
+    this._lastLifecycleState = null;
+    this._lastLifecycleAt = 0;
+    return keptCommandPermissions;
+  }
+
+  async updateCommandPermissions(permissions) {
+    // Validate: only allow known commands and valid levels
+    const validLevels = ["everyone", "moderator", "admin"];
+    const validCommands = Object.keys(DEFAULT_COMMAND_PERMISSIONS);
+    const cleaned = {};
+    for (const [cmd, level] of Object.entries(permissions)) {
+      if (validCommands.includes(cmd) && validLevels.includes(level)) {
+        cleaned[cmd] = level;
+      }
+    }
+    // Merged onto the current tiers, not onto the defaults: a command left
+    // out of `permissions` keeps its tier. Merging onto the defaults let a
+    // partial save (even `{}`) drop every raised tier back to its default
+    // without routes/discord.js's per-command capability check ever seeing
+    // that command (security sweep 2026-10-04, adversary pass on AUTHZ-3).
+    // The settings page sends every command, so nothing it does changes.
+    // HT4a: stored normalized, the way loadConfig() reads it back.
+    this.commandPermissions = normalizeCommandPermissions({
+      ...this.commandPermissions,
+      ...cleaned,
+    });
+    await setSetting(
+      "discordCommandPermissions",
+      JSON.stringify(this.commandPermissions),
+    );
+
+    // Re-register commands to update Discord-side default permissions
+    if (this.isRunning && this.client?.user) {
+      await this.registerCommands();
+    }
+    return this.commandPermissions;
+  }
+
+  getCommandPermissions() {
+    return { ...this.commandPermissions };
+  }
+
+  getCommands() {
+    const commands = [
+      {
+        builder: new SlashCommandBuilder()
+          .setName("status")
+          .setDescription("Get the current server status"),
+        name: "status",
+      },
+      {
+        builder: new SlashCommandBuilder()
+          .setName("players")
+          .setDescription("List online players"),
+        name: "players",
+      },
+      {
+        builder: new SlashCommandBuilder()
+          .setName("start")
+          .setDescription("Start the Project Zomboid server"),
+        name: "start",
+      },
+      {
+        builder: new SlashCommandBuilder()
+          .setName("stop")
+          .setDescription("Stop the server (with save)"),
+        name: "stop",
+      },
+      {
+        builder: new SlashCommandBuilder()
+          .setName("restart")
+          .setDescription("Restart the server with warning")
+          .addIntegerOption((option) =>
+            option
+              .setName("minutes")
+              .setDescription("Warning time in minutes before restart")
+              .setRequired(false)
+              .setMinValue(0)
+              .setMaxValue(30),
+          ),
+        name: "restart",
+      },
+      {
+        builder: new SlashCommandBuilder()
+          .setName("save")
+          .setDescription("Save the world"),
+        name: "save",
+      },
+      {
+        builder: new SlashCommandBuilder()
+          .setName("broadcast")
+          .setDescription("Send a message to all players")
+          .addStringOption((option) =>
+            option
+              .setName("message")
+              .setDescription("Message to broadcast")
+              .setRequired(true),
+          ),
+        name: "broadcast",
+      },
+      {
+        builder: new SlashCommandBuilder()
+          .setName("kick")
+          .setDescription("Kick a player from the server")
+          .addStringOption((option) =>
+            option
+              .setName("player")
+              .setDescription("Player name to kick")
+              .setRequired(true),
+          )
+          .addStringOption((option) =>
+            option
+              .setName("reason")
+              .setDescription("Reason for kick")
+              .setRequired(false),
+          ),
+        name: "kick",
+      },
+      {
+        builder: new SlashCommandBuilder()
+          .setName("rcon")
+          .setDescription("Execute a custom RCON command")
+          .addStringOption((option) =>
+            option
+              .setName("command")
+              .setDescription("RCON command to execute")
+              .setRequired(true),
+          ),
+        name: "rcon",
+      },
+      {
+        builder: new SlashCommandBuilder()
+          .setName("mods")
+          .setDescription(
+            "Post a download link and list for the server's mods export",
+          ),
+        name: "mods",
+      },
+    ];
+
+    // Discord-side defaults are only a fallback for when no role is configured
+    // here. Setting them unconditionally hid the command from the very roles the
+    // panel was told to trust, so the Admin/Moderator role settings did nothing
+    // unless the role also held Discord's Administrator permission. When a role
+    // is configured we leave the command visible and let checkPermission() answer,
+    // which replies with a clear refusal instead of hiding the command.
+    for (const cmd of commands) {
+      const level = commandTierOf(this.commandPermissions, cmd.name);
+      if (level === "admin" && !this.adminRoleId) {
+        cmd.builder.setDefaultMemberPermissions(
+          PermissionFlagsBits.Administrator,
+        );
+      } else if (level === "moderator" && !this.modRoleId && !this.adminRoleId) {
+        cmd.builder.setDefaultMemberPermissions(
+          PermissionFlagsBits.ManageMessages,
+        );
+      }
+      // 'everyone' = no restriction set
+    }
+
+    return commands.map((c) => c.builder);
+  }
+
+  async registerCommands() {
+    if (!this.token || !this.guildId) {
+      throw new Error("Discord token and guild ID are required");
+    }
+
+    if (!this.client || !this.client.user) {
+      throw new Error("Discord client not ready");
+    }
+
+    // Serialise concurrent registrations — a fresh boot can hit this via
+    // both start() and updateCommandPermissions() within the same tick.
+    if (this._registerInFlight) {
+      return this._registerInFlight;
+    }
+
+    const targetGuildId = this.guildId;
+    const targetUserId = this.client.user.id;
+    const rest = new REST({
+      version: "10",
+      makeRequest: _safeDiscordMakeRequest,
+    }).setToken(this.token);
+    const commands = this.getCommands().map((cmd) => cmd.toJSON());
+
+    this._registerInFlight = (async () => {
+      try {
+        log.info("Registering Discord slash commands...");
+        await withDiscordTimeout(
+          rest.put(
+            Routes.applicationGuildCommands(targetUserId, targetGuildId),
+            { body: commands },
+          ),
+          "command registration",
+        );
+        this._registeredGuildId = targetGuildId;
+        log.info(`Registered ${commands.length} Discord commands`);
+      } catch (error) {
+        log.error(
+          `Failed to register Discord commands: ${error.stack || error.message}`,
+        );
+        throw error;
+      } finally {
+        this._registerInFlight = null;
+      }
+    })();
+
+    return this._registerInFlight;
+  }
+
+  hasRole(interaction, roleId) {
+    if (!roleId) return false;
+    const member = interaction.member;
+    if (!member) return false;
+    if (member.roles && member.roles.cache) {
+      return member.roles.cache.has(roleId);
+    }
+    // Uncached guilds hand back the raw API member, whose roles are a plain
+    // array of IDs. Without this a moderator is silently denied.
+    if (Array.isArray(member.roles)) {
+      return member.roles.includes(roleId);
+    }
+    return false;
+  }
+
+  checkPermission(interaction, commandName) {
+    const level = commandTierOf(this.commandPermissions, commandName);
+
+    if (level === "everyone") return true;
+
+    // Server owner always has full access
+    if (interaction.guild && interaction.guild.ownerId === interaction.user.id)
+      return true;
+
+    // Discord Administrator permission holders can use everything
+    if (
+      interaction.member &&
+      typeof interaction.member.permissions?.has === "function" &&
+      interaction.member.permissions.has(PermissionFlagsBits.Administrator)
+    )
+      return true;
+
+    // Admin role holders can use everything
+    if (this.adminRoleId && this.hasRole(interaction, this.adminRoleId))
+      return true;
+
+    if (level === "moderator") {
+      // Moderator commands: need mod role or admin role
+      if (!this.modRoleId && !this.adminRoleId) return false;
+      if (this.modRoleId && this.hasRole(interaction, this.modRoleId))
+        return true;
+      return false;
+    }
+
+    if (level === "admin") {
+      // Admin commands: need admin role
+      if (!this.adminRoleId) return false;
+      return false; // Already checked above
+    }
+
+    return false;
+  }
+
+  async handleInteraction(interaction) {
+    if (!interaction.isChatInputCommand()) return;
+
+    const { commandName } = interaction;
+    log.info(
+      `Discord command: /${commandName} by ${interaction.user?.tag || "unknown"}`,
+    );
+
+    // SECURITY (2026-10-05, D2): answer only in the guild the panel is set
+    // up for. Moving the bot to another guild needs every command's
+    // capability (routes/discord.js) because checkPermission() lets that
+    // guild's owner and Administrators run everything. But the commands
+    // registered in a previous guild stay there whenever updateConfig()'s
+    // cleanup didn't run (the bot was stopped during the move) or failed,
+    // and so do resetConfig()'s -- and that guild's owner passed
+    // checkPermission() just the same, with the bot still a member there.
+    if (
+      !this.guildId ||
+      String(interaction.guildId ?? "") !== String(this.guildId)
+    ) {
+      log.warn(
+        `Refused /${commandName} from guild ${interaction.guildId || "(none)"}: not the configured guild`,
+      );
+      await interaction.reply({
+        content: "❌ This bot isn't set up for this server.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    // Check permission based on command's configured tier
+    if (!this.checkPermission(interaction, commandName)) {
+      const level = commandTierOf(this.commandPermissions, commandName);
+      const roleName = level === "admin" ? "Admin" : "Moderator";
+      await interaction.reply({
+        content: `❌ You need the **${roleName}** role to use this command.`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    try {
+      switch (commandName) {
+        case "status":
+          await this.handleStatus(interaction);
+          break;
+        case "players":
+          await this.handlePlayers(interaction);
+          break;
+        case "start":
+          await this.handleStart(interaction);
+          break;
+        case "stop":
+          await this.handleStop(interaction);
+          break;
+        case "restart":
+          await this.handleRestart(interaction);
+          break;
+        case "save":
+          await this.handleSave(interaction);
+          break;
+        case "broadcast":
+          await this.handleBroadcast(interaction);
+          break;
+        case "kick":
+          await this.handleKick(interaction);
+          break;
+        case "rcon":
+          await this.handleRcon(interaction);
+          break;
+        case "mods":
+          await this.handleMods(interaction);
+          break;
+        default:
+          await interaction.reply({
+            content: "Unknown command",
+            flags: MessageFlags.Ephemeral,
+          });
+      }
+    } catch (error) {
+      log.error(`command error: ${error.stack || error.message}`);
+      try {
+        const content = `❌ Error: ${sanitizeError(error.message)}`;
+        if (interaction.replied || interaction.deferred) {
+          await interaction.followUp({
+            content,
+            flags: MessageFlags.Ephemeral,
+          });
+        } else {
+          await interaction.reply({ content, flags: MessageFlags.Ephemeral });
+        }
+      } catch (replyError) {
+        log.error(
+          `Failed to send error reply: ${replyError.stack || replyError.message}`,
+        );
+      }
+    }
+  }
+
+  async handleStatus(interaction) {
+    await interaction.deferReply();
+
+    // getServerStatus() is still the source for uptime/etc, but its OWN
+    // .running/.scanFailed come from the local process scan alone -- wrong
+    // for a split-container/docker-managed setup where PZ is genuinely up
+    // but not locally visible (GH#114). resolveObservedServerRunning() is
+    // the same OR-of-every-signal verdict the dashboard badge and the
+    // status watchdog use, so this can't disagree with either of them.
+    const status = await this.serverManager.getServerStatus();
+    const observedRunning = await resolveObservedServerRunning(
+      this.serverManager,
+      this.rconService,
+    );
+    const isRunning = observedRunning === true;
+    const statusUnknown = observedRunning === null;
+
+    // Format uptime from seconds
+    let uptimeStr = "N/A";
+    if (status.uptime && status.uptime > 0) {
+      const hours = Math.floor(status.uptime / 3600);
+      const minutes = Math.floor((status.uptime % 3600) / 60);
+      uptimeStr = hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
+    }
+
+    const embed = new EmbedBuilder()
+      .setTitle("🧟 Project Zomboid Server Status")
+      .setColor(statusUnknown ? 0xffaa00 : isRunning ? 0x00ff00 : 0xff0000)
+      .addFields(
+        {
+          name: "Status",
+          value: statusUnknown
+            ? "🟡 Unknown (detection failed)"
+            : isRunning
+              ? "🟢 Online"
+              : "🔴 Offline",
+          inline: true,
+        },
+        { name: "Uptime", value: uptimeStr, inline: true },
+      )
+      .setTimestamp();
+
+    if (isRunning) {
+      try {
+        const players = await this.rconService.getPlayers();
+        if (players.success) {
+          embed.addFields({
+            name: "Players Online",
+            value: `${players.players?.length || 0}`,
+            inline: true,
+          });
+        }
+      } catch (e) {
+        log.debug(`Discord status: RCON error for player count: ${e.message}`);
+      }
+    }
+
+    await interaction.editReply({ embeds: [embed] });
+  }
+
+  async handlePlayers(interaction) {
+    await interaction.deferReply();
+
+    // See handleStatus()'s comment: the raw local scan alone can't see a
+    // split-container/docker-managed server, so this asks the same
+    // OR-every-signal question the dashboard badge and watchdog do.
+    const observedRunning = await resolveObservedServerRunning(
+      this.serverManager,
+      this.rconService,
+    );
+    if (observedRunning === null) {
+      await interaction.editReply(
+        "🟡 Unable to verify server status — try again shortly.",
+      );
+      return;
+    }
+    if (!observedRunning) {
+      await interaction.editReply("🔴 Server is offline");
+      return;
+    }
+
+    if (!this.rconService?.connected) {
+      await interaction.editReply(
+        "❌ RCON is not connected — cannot list players.",
+      );
+      return;
+    }
+
+    const result = await this.rconService.getPlayers();
+
+    if (!result.success) {
+      await interaction.editReply(
+        `❌ Failed to get players: ${sanitizeError(result.error)}`,
+      );
+      return;
+    }
+
+    const players = result.players || [];
+
+    // Discord embed description is hard-capped at 4096 chars. Build the
+    // list incrementally and stop just shy of the cap, appending a
+    // truncation footer instead of crashing the editReply call.
+    const MAX_DESC = 4000; // leave room for the truncation suffix
+    let description;
+    if (players.length === 0) {
+      description = "No players online";
+    } else {
+      const lines = [];
+      let total = 0;
+      let truncated = 0;
+      for (let i = 0; i < players.length; i++) {
+        const p = players[i];
+        const line = `• ${escapeMarkdown(String(typeof p === "object" ? (p.name ?? "") : p))}`;
+        if (total + line.length + 1 > MAX_DESC) {
+          truncated = players.length - i;
+          break;
+        }
+        lines.push(line);
+        total += line.length + 1;
+      }
+      if (truncated > 0) lines.push(`… and ${truncated} more`);
+      description = lines.join("\n");
+    }
+
+    const embed = new EmbedBuilder()
+      .setTitle("👥 Online Players")
+      .setColor(0x3498db)
+      .setDescription(description)
+      .setFooter({ text: `${players.length} player(s)` })
+      .setTimestamp();
+
+    await interaction.editReply({ embeds: [embed] });
+  }
+
+  async handleStart(interaction) {
+    await interaction.deferReply();
+    // Fetched before acquiring the lock (a pure DB read) so a refusal from
+    // a concurrent operation can name which server it's for -- see
+    // lifecycleCoordinator.js's comment.
+    const activeServerForLock = await getActiveServer();
+    const lifecycleLock = acquireLifecycleLock(
+      "discord-start",
+      activeServerForLock?.id ?? null,
+    );
+    if (!lifecycleLock) {
+      await interaction.editReply(lifecycleInProgressResponse().error);
+      return;
+    }
+
+    try {
+      const activeServer = activeServerForLock;
+      // Use the shared provider-aware verdict so split-container servers do
+      // not look stopped merely because their process is outside this host.
+      const observedRunning = await resolveObservedServerRunning(
+        this.serverManager,
+        this.rconService,
+      );
+      if (observedRunning === null) {
+        await interaction.editReply(
+          "⚠️ Unable to verify whether the server is already running — refusing to start to avoid launching a second process. Check the panel UI directly.",
+        );
+        return;
+      }
+      if (observedRunning) {
+        await interaction.editReply("⚠️ Server is already running");
+        return;
+      }
+
+      // A container-managed server starts through Docker — the panel has no
+      // process to spawn inside another container.
+      const managed = await runManagedLifecycle("start", {
+        serverId: activeServer?.id ?? null,
+      });
+      const started = managed.handled
+        ? managed
+        : await this.serverManager.startServer({
+            serverId: activeServer?.id ?? null,
+          });
+      if (!started?.success) {
+        await interaction.editReply(
+          `❌ Failed to start the server: ${sanitizeError(started?.error || started?.message)}`,
+        );
+        return;
+      }
+      await interaction.editReply(
+        started.alreadyRunning ? "✅ Server is already running" : "🚀 Server is starting...",
+      );
+      if (started.alreadyRunning) return;
+
+      // Send notification to channel
+      const safeTag = escapeMarkdown(String(interaction.user.tag));
+      await this.sendNotification(`🚀 **Server started** by ${safeTag}`);
+    } finally {
+      lifecycleLock.release();
+    }
+  }
+
+  async handleStop(interaction) {
+    await interaction.deferReply();
+    // See handleStart's comment above for why this is fetched before the lock.
+    const activeServerForLock = await getActiveServer();
+    const lifecycleLock = acquireLifecycleLock(
+      "discord-stop",
+      activeServerForLock?.id ?? null,
+    );
+    if (!lifecycleLock) {
+      await interaction.editReply(lifecycleInProgressResponse().error);
+      return;
+    }
+    try {
+      const activeServer = activeServerForLock;
+      const observedRunning = await resolveObservedServerRunning(
+        this.serverManager,
+        this.rconService,
+      );
+      if (observedRunning === null) {
+        await interaction.editReply(
+          "⚠️ Unable to verify whether the server is running. Check the panel UI directly before retrying.",
+        );
+        return;
+      }
+      if (!observedRunning) {
+        await interaction.editReply("⚠️ Server is not running");
+        return;
+      }
+
+      if (!this.rconService?.connected) {
+        await interaction.editReply(
+          "❌ RCON is not connected — cannot gracefully stop the server. Use the panel UI to force-stop if needed.",
+        );
+        return;
+      }
+
+      // Quitting after a failed save would discard everything since the last one.
+      const saved = await this.rconService.save();
+      if (!saved?.success) {
+        await interaction.editReply(
+          `❌ Save failed, so the server was left running: ${sanitizeError(saved?.error)}`,
+        );
+        return;
+      }
+      // A container-managed server must go down through Docker: RCON quit kills
+      // PID 1, the container exits, and its restart policy brings the world back.
+      const managed = await runManagedLifecycle("stop", {
+        serverId: activeServer?.id ?? null,
+      });
+      const quit = managed.handled
+        ? managed
+        : await this.rconService.quit();
+      if (!quit?.success) {
+        await interaction.editReply(
+          `❌ The world was saved, but the shutdown command failed: ${sanitizeError(quit?.error)}`,
+        );
+        return;
+      }
+
+      await interaction.editReply("🛑 Server is stopping...");
+      const safeTag = escapeMarkdown(String(interaction.user.tag));
+      await this.sendNotification(`🛑 **Server stopped** by ${safeTag}`);
+    } finally {
+      lifecycleLock.release();
+    }
+  }
+
+  async handleRestart(interaction) {
+    await interaction.deferReply();
+    // See handleStart's comment above for why this is fetched before the
+    // lock -- this.serverManager?.serverName was a display name (or a stale
+    // one, if serverManager hadn't loaded any config yet), not the server DB
+    // id normalize-lifecycle-lock-server-identifier standardized on.
+    const activeServerForLock = await getActiveServer();
+    const lifecycleLock = acquireLifecycleLock(
+      "discord-restart",
+      activeServerForLock?.id ?? null,
+    );
+    if (!lifecycleLock) {
+      await interaction.editReply(lifecycleInProgressResponse().error);
+      return;
+    }
+
+    try {
+      const minutes = interaction.options.getInteger("minutes") ?? 5;
+
+      // See handleStart()'s comment: the raw local scan alone can't see a
+      // split-container/docker-managed server.
+      const observedRunning = await resolveObservedServerRunning(
+        this.serverManager,
+        this.rconService,
+      );
+      if (observedRunning === null) {
+        await interaction.editReply(
+          "⚠️ Unable to verify whether the server is running. Check the panel UI directly before retrying.",
+        );
+        return;
+      }
+      if (!observedRunning) {
+        await interaction.editReply(
+          "⚠️ Server is not running. Use /start to start the server.",
+        );
+        return;
+      }
+
+      if (!this.rconService?.connected) {
+        await interaction.editReply(
+          "❌ RCON is not connected — cannot send the restart warning. Try again once RCON reconnects.",
+        );
+        return;
+      }
+
+      // The scheduler opens its own countdown with the same warning, so an
+      // extra notice here only doubles it in game — and unlike the scheduler's
+      // it lacks the [SERVER] prefix, so it leaks back into the chat relay.
+      await interaction.editReply(
+        `🔄 Server restart initiated (${minutes} min warning)`,
+      );
+      const safeTag = escapeMarkdown(String(interaction.user.tag));
+      await this.sendNotification(
+        `🔄 **Server restart** initiated by ${safeTag}`,
+      );
+
+      // Use scheduler for proper restart with the specified warning time
+      try {
+        // performRestart reports refusal and failure by return value rather than
+        // by throwing, so without this the command always claims it worked.
+        const result = await this.scheduler.performRestart(minutes, {
+          lifecycleLock,
+        });
+        if (!result?.success) {
+          await this._reportRestartOutcome(
+            interaction,
+            `❌ Restart did not complete: ${sanitizeError(result?.message || "unknown error")}`,
+          );
+        }
+      } catch (error) {
+        log.error(`restart failed: ${error.message}`);
+        await this._reportRestartOutcome(
+          interaction,
+          `❌ Server restart failed: ${sanitizeError(error.message)}`,
+        );
+      }
+    } finally {
+      lifecycleLock.release();
+    }
+  }
+
+  // A long warning can outlive the 15-minute interaction token, so fall back
+  // to the notification channel rather than losing the outcome entirely.
+  async _reportRestartOutcome(interaction, text) {
+    try {
+      await interaction.editReply(text);
+    } catch {
+      await this.sendNotification(text);
+    }
+  }
+
+  async handleSave(interaction) {
+    await interaction.deferReply();
+
+    if (!this.rconService?.connected) {
+      await interaction.editReply("❌ RCON is not connected — cannot save.");
+      return;
+    }
+
+    const result = await this.rconService.save();
+
+    if (result.success) {
+      await interaction.editReply("💾 World saved successfully");
+    } else {
+      await interaction.editReply(
+        `❌ Save failed: ${sanitizeError(result.error)}`,
+      );
+    }
+  }
+
+  async handleBroadcast(interaction) {
+    const message = interaction.options.getString("message");
+
+    await interaction.deferReply();
+
+    if (!this.rconService?.connected) {
+      await interaction.editReply(
+        "❌ RCON is not connected — cannot broadcast.",
+      );
+      return;
+    }
+
+    // Cap at 200 chars — PZ chat UI gets cluttered with very long messages
+    // and overlong RCON payloads can stall the server briefly.
+    const safeMessage = String(message)
+      .replace(/[\r\n]+/g, " ")
+      .slice(0, 200);
+
+    const result = await this.rconService.serverMessage(safeMessage);
+
+    if (result.success) {
+      await interaction.editReply(
+        `📢 Broadcast sent: "${escapeMarkdown(safeMessage)}"`,
+      );
+    } else {
+      await interaction.editReply(
+        `❌ Broadcast failed: ${sanitizeError(result.error)}`,
+      );
+    }
+  }
+
+  async handleKick(interaction) {
+    const player = interaction.options.getString("player");
+    // Raw, possibly null -- fed to kickPlayer() as-is (its own `-r` flag is
+    // conditional on a non-empty reason, same as the HTTP route). Only the
+    // DISPLAY text below defaults to "No reason given"; forcing that
+    // default into the actual RCON call would send a reason the moderator
+    // never typed.
+    const rawReason = interaction.options.getString("reason");
+    const displayReason = rawReason || "No reason given";
+
+    await interaction.deferReply();
+
+    if (!this.rconService?.connected) {
+      await interaction.editReply("❌ RCON is not connected — cannot kick.");
+      return;
+    }
+
+    // round-5 bug-hunt: this used to hand-roll `kickuser "<name>"` with no
+    // `-r` flag at all, on the mistaken belief PZ's kickuser has no reason
+    // flag -- it does (rconService.kickPlayer(), already used by the HTTP
+    // route players.js POST /kick and covered by rcon.test.js). Every
+    // reason a moderator typed was silently discarded before reaching RCON,
+    // even though this command's own reply/notification below claimed it
+    // was sent. kickPlayer() sanitizes both username and reason internally
+    // (sanitizeQuotedArg/sanitizeForBanReason) and throws on an invalid
+    // username instead of returning an empty string.
+    let result;
+    try {
+      result = await this.rconService.kickPlayer(player, rawReason);
+    } catch (error) {
+      await interaction.editReply(`❌ ${sanitizeError(error.message)}`);
+      return;
+    }
+
+    if (result.success) {
+      const safeName = escapeMarkdown(String(player));
+      const safeTag = escapeMarkdown(String(interaction.user.tag));
+      const safeReason = escapeMarkdown(String(displayReason));
+      await interaction.editReply(`👢 Kicked ${safeName}: ${safeReason}`);
+      await this.sendNotification(
+        `👢 **${safeName}** was kicked by ${safeTag}\nReason: ${safeReason}`,
+      );
+    } else {
+      await interaction.editReply(
+        `❌ Kick failed: ${sanitizeError(result.error)}`,
+      );
+    }
+  }
+
+  async handleRcon(interaction) {
+    const command = interaction.options.getString("command");
+
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+    if (!this.rconService?.connected) {
+      await interaction.editReply("❌ RCON is not connected.");
+      return;
+    }
+
+    // Cap RCON commands at 500 chars — anything longer is almost certainly
+    // accidental (copy-paste) and risks tripping RCON packet limits.
+    const trimmed = String(command).slice(0, 500);
+    const safeCommand = this.rconService.sanitize(trimmed);
+    if (!safeCommand) {
+      await interaction.editReply("❌ Empty or invalid command.");
+      return;
+    }
+    const result = await this.rconService.execute(safeCommand);
+
+    // Discord message bodies cap at 2000 chars; trim response to keep room
+    // for the code-fence wrapper. Strip ``` from the response — leaving them
+    // in would break the surrounding triple-backtick code fence.
+    const rawResponse = String(result.response || "No response")
+      .replace(/`{3,}/g, "\u02cb\u02cb\u02cb")
+      .slice(0, 1800);
+    const response = result.success
+      ? `✅ **Response:**\n\`\`\`${rawResponse}\`\`\``
+      : `❌ **Error:** ${sanitizeError(result.error)}`;
+
+    await interaction.editReply(response);
+  }
+
+  // /mods: post a summary of the server's local mods/ folder (the same one
+  // the panel's "Export mods" button zips) to the mods-export channel, with
+  // a button linking to a public download of the ZIP. The ZIP is uploaded to
+  // VikingFile (utils/vikingfile.js) so the link works for anyone; if that
+  // fails, the button falls back to the panel's own /api/mods/export-download
+  // endpoint, which carries the share token (utils/modsExport.js) that
+  // authService's middleware accepts without a panel login.
+  async handleMods(interaction) {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+    // Dedicated channel if set, else the notification channel (the same
+    // fallback the chat relay uses).
+    const targetChannelId = this.modsExportChannelId || this.channelId;
+    if (!targetChannelId) {
+      await interaction.editReply(
+        "❌ No mods-export channel is set, and there is no notification channel to fall back to. Set one on the panel's Discord page.",
+      );
+      return;
+    }
+
+    const activeServer = await getActiveServer();
+    const zomboidDataPath =
+      activeServer?.zomboidDataPath ||
+      (await getSetting("zomboidDataPath")) ||
+      null;
+    const modsDir = zomboidDataPath ? path.join(zomboidDataPath, "mods") : null;
+    if (!modsDir || !fs.existsSync(modsDir)) {
+      await interaction.editReply(
+        "❌ The server's local mods folder could not be found, so there is nothing to export.",
+      );
+      return;
+    }
+
+    const summary = measureModsDir(modsDir);
+    const serverName =
+      activeServer?.name || (await getSetting("serverName")) || null;
+
+    // Prefer a public VikingFile link (uploaded here) so the button works for
+    // anyone; fall back to the panel's own export endpoint if the upload
+    // fails, so /mods still produces a usable link.
+    let downloadUrl;
+    try {
+      const uploaded = await ensureModsExportUpload({
+        modsDir,
+        serverName,
+        summary,
+      });
+      downloadUrl = uploaded.url;
+    } catch (error) {
+      log.warn(
+        `Mods export upload to VikingFile failed, falling back to the panel link: ${error.message}`,
+      );
+      const baseUrl = await this.resolveModsExportBaseUrl();
+      const token = await getModsExportShareToken();
+      downloadUrl = `${baseUrl}/api/mods/export-download?share=${encodeURIComponent(token)}`;
+    }
+
+    const embed = this.buildModsExportEmbed(summary);
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setLabel("Download mods (.zip)")
+        .setStyle(ButtonStyle.Link)
+        .setURL(downloadUrl),
+    );
+
+    const sent = await this._sendToChannel(
+      targetChannelId,
+      { embeds: [embed], components: [row] },
+      { label: "mods export" },
+    );
+
+    if (!sent) {
+      if (this.wasSendRefusedOutsideGuild(targetChannelId)) {
+        await interaction.editReply(
+          "❌ The mods-export channel isn't in the Discord server set up here, so the bot won't post in it. Use a channel of that server, or correct the Guild ID.",
+        );
+      } else {
+        await interaction.editReply(
+          "❌ Discord rejected the mods export message. Check the channel ID and that the bot can post there.",
+        );
+      }
+      return;
+    }
+
+    await interaction.editReply(
+      `✅ Posted the mods export (${summary.count} mods, ${formatBytes(summary.totalBytes)}) to <#${targetChannelId}>.`,
+    );
+  }
+
+  // The click-through base for the /mods link. An explicit setting wins;
+  // otherwise the panel's own LAN address + port, which only works for
+  // clients that can reach the panel (the override field, or a reverse
+  // proxy, is what public servers want).
+  async resolveModsExportBaseUrl() {
+    if (this.modsExportBaseUrl) return this.modsExportBaseUrl;
+    const httpsRaw = await getSetting("httpsEnabled");
+    const httpsEnabled =
+      httpsRaw === true || String(httpsRaw).toLowerCase() === "true";
+    const localIp = await this.serverManager.getLocalIp();
+    if (httpsEnabled) {
+      const httpsPort = Number(await getSetting("httpsPort")) || 3443;
+      return `https://${localIp}:${httpsPort}`;
+    }
+    const panelPort = Number(await getSetting("panelPort")) || 3001;
+    return `http://${localIp}:${panelPort}`;
+  }
+
+  buildModsExportEmbed(summary) {
+    // Discord's embed description hard-caps at 4096 chars. Build the folder
+    // list incrementally and stop short of the cap, appending a truncation
+    // footer instead of letting the send fail.
+    const MAX_LIST_CHARS = 3900;
+    let list = "";
+    let shown = 0;
+    for (const folder of summary.folders) {
+      // Folder names come from the filesystem: strip characters that would
+      // break the surrounding code fence.
+      const name = String(folder.name).replace(/[`\r\n]+/g, " ").trim();
+      if (!name) continue;
+      const next = list ? `${list}\n${name}` : name;
+      if (next.length > MAX_LIST_CHARS) break;
+      list = next;
+      shown++;
+    }
+    const hidden = summary.count - shown;
+    let description = list ? `\`\`\`\n${list}\n\`\`\`` : "No mods found.";
+    if (hidden > 0) {
+      description += `\n…and ${hidden} more mod${hidden === 1 ? "" : "s"}.`;
+    }
+
+    return new EmbedBuilder()
+      .setTitle("📦 Server mods export")
+      .setColor(0x5865f2)
+      .setDescription(description)
+      .addFields(
+        { name: "Mods", value: String(summary.count), inline: true },
+        { name: "Files", value: String(summary.totalFiles), inline: true },
+        { name: "Size", value: formatBytes(summary.totalBytes), inline: true },
+      )
+      .setTimestamp();
+  }
+
+  async sendNotification(message) {
+    if (!this.channelId || !this.client) return false;
+    log.info(
+      `Sending Discord notification: ${String(message).substring(0, 80)}`,
+    );
+    return await this._sendToChannel(this.channelId, message, {
+      label: "notification",
+    });
+  }
+
+  // Post an image (by URL) to the notification channel as the bot, with an
+  // optional caption. Used by the settings page's "Send image" field so an
+  // operator can post a picture (an announcement banner, a map, ...) to the
+  // server channel without leaving the panel. The image goes in an embed
+  // (setImage) rather than being sent as a bare URL: an embed renders the
+  // picture directly, where a bare link depends on Discord deciding to
+  // unfurl it. Returns false the same way every other send does, so the
+  // caller can report a refusal rather than a silent no-op.
+  async sendImageMessage(imageUrl, content = "") {
+    if (!this.channelId || !this.client) return false;
+    log.info(`Sending Discord image message to ${this.channelId}`);
+    const embed = new EmbedBuilder().setImage(imageUrl).setColor(0x5865f2);
+    const payload = content ? { content, embeds: [embed] } : { embeds: [embed] };
+    return await this._sendToChannel(this.channelId, payload, {
+      label: "image",
+    });
+  }
+
+  // Post an image uploaded from the operator's device (or pasted from the
+  // clipboard) as a real Discord attachment, with an optional caption. Unlike
+  // sendImageMessage — an embed pointing at a public http(s) URL — this works
+  // for an image that exists only on the operator's machine, and does not
+  // require the panel itself to be reachable from Discord. Returns false the
+  // same way every other send does, so the caller reports a refusal rather
+  // than a silent no-op.
+  async sendImageAttachment(buffer, filename, content = "") {
+    if (!this.channelId || !this.client) return false;
+    log.info(`Sending Discord image attachment to ${this.channelId}`);
+    const attachment = new AttachmentBuilder(buffer, { name: filename });
+    const payload = content
+      ? { content, files: [attachment] }
+      : { files: [attachment] };
+    return await this._sendToChannel(this.channelId, payload, {
+      label: "image attachment",
+    });
+  }
+
+  // Centralized channel send with circuit-breaker. All Discord-bound message
+  // sends (notifications, webhook events, chat relay) should go through here
+  // so a Discord outage doesn't spam logs from multiple code paths.
+  async _sendToChannel(channelId, message, { label = "message" } = {}) {
+    if (!channelId || !this.client) return false;
+
+    const FAILURE_THRESHOLD = 3;
+    const COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
+    // @discordjs/rest retries a 429 indefinitely with NO attempt cap: its
+    // runRequest() re-recurses on every 429 response without ever
+    // incrementing the same `retries` counter a non-429 failure uses (that
+    // path IS capped, at options.retries = 3). Confirmed empirically against
+    // a real (mocked) Discord API that returns 429 on every attempt:
+    // channel.send() sat unresolved past 60s with nothing logged, because
+    // the catch block below — and the circuit breaker it drives — is never
+    // reached while the promise never settles. A sustained rate limit is a
+    // real scenario (global rate limit, temporary token flag), and without
+    // this bound it silently wedges every future send the same way, forever
+    // — the exact "reports nothing, reaches nobody" shape this bot exists to
+    // avoid. This does not change discord.js's own retry behavior; it only
+    // stops US from waiting on it past a sane ceiling so the breaker can do
+    // its job. See server/tests/linuxDiscordSendTimeout.test.js.
+    const now = Date.now();
+    const breaker = this._breakerFor(channelId);
+
+    if (now < breaker.openUntil) {
+      breaker.suppressed++;
+      return false;
+    }
+
+    try {
+      const channel = await withDiscordTimeout(
+        this.client.channels.fetch(channelId),
+        "channel lookup",
+      );
+      if (!channel?.isTextBased?.() || typeof channel.send !== "function") {
+        throw new Error("Configured channel is not a sendable text channel");
+      }
+      // SECURITY (2026-10-05, M2): only to a channel of the guild the panel
+      // is set up for, as the Discord-to-game relay reads (HT4b) and slash
+      // commands answer (D2) only there. Game chat (to the relay channel, or
+      // the notification channel while none is set) and every notification
+      // went to whatever channel ID was saved, so one in another guild the
+      // bot is a member of -- or a direct-message channel -- received player
+      // chat, names and server events. Not a breaker failure: nothing was
+      // sent, and only a settings change makes the next send any different.
+      if (!this._isChannelInConfiguredGuild(channel)) {
+        this._refuseOutsideGuild(channelId, channel, label);
+        return false;
+      }
+      this._outsideGuildRefusals.delete(channelId);
+      // bug-hunt-2026-09-18 (round: Discord bot commands and relay): a
+      // caller-side length cap applied BEFORE escapeMarkdown() (e.g.
+      // handleGameChat()'s own message.slice(0, 1850)/author.slice(0, 80))
+      // is not a real cap on the final Discord API payload -- escaping
+      // wraps every markdown-special character in a backslash, which can
+      // nearly double a string's length, and handleGameChat() then
+      // concatenates the escaped author+message with no cap of its own
+      // afterward. A chat line that's heavy on `*`/`_`/`` ` ``/`~` (a
+      // player's own ASCII-art message, not necessarily malicious) could
+      // come out over Discord's real 2000-char hard limit post-escaping
+      // and get rejected outright, silently dropping that one relay
+      // message. This is the one place every string send (chat relay,
+      // notifications, replies) funnels through, so it's the one place
+      // that needs to know the TRUE final length, after every upstream
+      // transform has already run.
+      // A string is length-capped as before; an object payload (embeds /
+      // components, e.g. the /mods export message) is passed through as-is.
+      // Discord enforces its own limits on those, and callers build them to
+      // fit (see buildModsExportEmbed()).
+      const payload =
+        typeof message === "string" && message.length > 2000
+          ? `${message.slice(0, 1997)}...`
+          : message;
+      await withDiscordTimeout(channel.send(payload), "send");
+      if (breaker.failures > 0 || breaker.suppressed > 0) {
+        if (breaker.suppressed > 0) {
+          log.info(
+            `Discord channel ${channelId} recovered — ${breaker.suppressed} send(s) were suppressed during the outage`,
+          );
+        }
+        breaker.failures = 0;
+        breaker.suppressed = 0;
+      }
+      return true;
+    } catch (error) {
+      this._outsideGuildRefusals.delete(channelId);
+      breaker.failures++;
+      // A 5xx is Discord's own outage, not our configuration — classify it
+      // alongside the network-level codes below rather than lumping it in
+      // with "channel deleted / missing perms", which used to give a
+      // transient Discord-side outage the same 30-minute (mis)treatment as
+      // a real config problem, AND logged a misleading "misconfigured"
+      // reason for something an admin can't fix by touching settings.
+      // error.status is set by both of @discordjs/rest's own error classes
+      // (DiscordAPIError, HTTPError) — checking it is exact, unlike sniffing
+      // error.message for a status-shaped substring.
+      const transient =
+        (typeof error.status === "number" &&
+          error.status >= 500 &&
+          error.status < 600) ||
+        /EAI_AGAIN|ENOTFOUND|ETIMEDOUT|ECONNRESET|ECONNREFUSED|Connect Timeout|fetch failed|UND_ERR/i.test(
+          error.message || "",
+        );
+
+      // Open the circuit on N consecutive failures of ANY kind. For
+      // non-transient errors (channel deleted, missing perms, invalid token)
+      // we hold the breaker longer since retries won't help — only an admin
+      // fixing config will. For transient network errors, COOLDOWN_MS is
+      // enough for a typical DNS/route blip to resolve.
+      if (breaker.failures >= FAILURE_THRESHOLD) {
+        const cooldown = transient ? COOLDOWN_MS : COOLDOWN_MS * 6; // 5 min vs 30 min
+        breaker.openUntil = now + cooldown;
+        const kind = transient
+          ? "unreachable"
+          : "misconfigured (likely channel/perms)";
+        log.error(
+          `Discord ${kind} for channel ${channelId} (${breaker.failures} consecutive failures): ${error.message}. Suppressing ${label} sends for ${Math.round(cooldown / 60000)} min.`,
+        );
+      } else {
+        log.error(`Failed to send Discord ${label}: ${error.message}`);
+      }
+      return false;
+    }
+  }
+
+  _breakerFor(channelId) {
+    let breaker = this._channelBreakers.get(channelId);
+    if (!breaker) {
+      breaker = { failures: 0, openUntil: 0, suppressed: 0 };
+      this._channelBreakers.set(channelId, breaker);
+    }
+    return breaker;
+  }
+
+  // M2: a guild channel or thread carries the guild's ID; a direct-message
+  // channel carries none. Compared as text, like the relay's own check.
+  _isChannelInConfiguredGuild(channel) {
+    return (
+      Boolean(this.guildId) &&
+      String(channel?.guildId ?? "") === String(this.guildId)
+    );
+  }
+
+  // M2: warns when a channel is first refused, when what it is refused for
+  // changes, and then every OUTSIDE_GUILD_WARN_INTERVAL_MS with the number
+  // of sends refused since.
+  _refuseOutsideGuild(channelId, channel, label) {
+    const channelGuildId = channel?.guildId ? String(channel.guildId) : null;
+    const configuredGuildId = this.guildId ? String(this.guildId) : null;
+    const now = Date.now();
+    const last = this._outsideGuildRefusals.get(channelId);
+    if (
+      last &&
+      last.channelGuildId === channelGuildId &&
+      last.configuredGuildId === configuredGuildId &&
+      now - last.warnedAt < OUTSIDE_GUILD_WARN_INTERVAL_MS
+    ) {
+      last.since++;
+      return;
+    }
+    const configured = configuredGuildId
+      ? `the one set up in the panel (Guild ID ${configuredGuildId})`
+      : "one set up in the panel (no Guild ID is set)";
+    const where = channelGuildId
+      ? `it is in Discord server ${channelGuildId}, not in ${configured}`
+      : `it is not in a Discord server (a direct message), so not in ${configured}`;
+    const more = last?.since
+      ? ` ${last.since} other send(s) to it were refused since the last warning.`
+      : "";
+    log.warn(
+      `Not sending the Discord ${label} to channel ${channelId}: ${where}. Set a channel of that server on the Discord page, or correct the Guild ID.${more}`,
+    );
+    this._outsideGuildRefusals.set(channelId, {
+      channelGuildId,
+      configuredGuildId,
+      warnedAt: now,
+      since: 0,
+    });
+  }
+
+  // Whether the last send to `channelId` was refused because the channel
+  // isn't in the configured guild (M2), for POST /test-message's reason.
+  wasSendRefusedOutsideGuild(channelId) {
+    return Boolean(channelId) && this._outsideGuildRefusals.has(channelId);
+  }
+
+  async getConfiguredMaxPlayers() {
+    try {
+      const activeServer = await getActiveServer();
+      const serverName = activeServer?.serverName || (await getSetting("serverName"));
+      // SECURITY (2026-10-05, PATHS-2): MaxPlayers goes out in the bot's
+      // public presence, so it is read only from the config folder Server
+      // Files uses: a configured one only while it is inside the data folder
+      // in effect (utils/serverConfigPath.js).
+      const legacy = activeServer?.zomboidDataPath
+        ? {}
+        : {
+            serverConfigPath: await getSetting("serverConfigPath"),
+            zomboidDataPath: await getSetting("zomboidDataPath"),
+          };
+      const config = activeServerConfigDir(activeServer, legacy);
+      // SECURITY (2026-10-05, PT3/PT5): refused, the presence leaves
+      // MaxPlayers out, and the presence is public, so the reason goes to
+      // the log -- with its code and what to set, at warn once per folder
+      // and reason (this runs on every presence update), then at debug.
+      if (config.refused) {
+        logRefusalOnce(
+          log,
+          `Discord presence: not reading MaxPlayers (Zomboid data folder: ${config.dataPath || "not set"}): ${describeRefusal(serverConfigDirRefusal(config))}`,
+        );
+      }
+      const configPath = config.dir;
+
+      if (
+        !configPath ||
+        !serverName ||
+        typeof serverName !== "string" ||
+        path.basename(serverName) !== serverName ||
+        serverName.includes("..")
+      ) {
+        return null;
+      }
+
+      const iniPath = path.join(configPath, `${serverName}.ini`);
+      if (!fs.existsSync(iniPath)) return null;
+
+      const content = fs.readFileSync(iniPath, "utf8");
+      const maxPlayers = Number.parseInt(
+        readIniValues(content, ["MaxPlayers"]).MaxPlayers,
+        10,
+      );
+      return Number.isInteger(maxPlayers) && maxPlayers > 0 ? maxPlayers : null;
+    } catch (error) {
+      log.debug(`Could not read MaxPlayers for Discord presence: ${error.message}`);
+      return null;
+    }
+  }
+
+  async updatePlayerPresence() {
+    if (!this.isRunning || !this.client?.user || !this.serverManager) return;
+    if (this._presenceUpdateInFlight) return this._presenceUpdateInFlight;
+
+    this._presenceUpdateInFlight = (async () => {
+      let activity = this.presence.offline;
+      try {
+        // See handleStart()'s comment: the raw local scan alone can't see a
+        // split-container/docker-managed server, and this presence text was
+        // stuck on "Server offline" forever for that topology even with
+        // RCON connected.
+        const observedRunning = await resolveObservedServerRunning(
+          this.serverManager,
+          this.rconService,
+        );
+        if (observedRunning === null) {
+          activity = this.presence.unknown;
+        } else if (observedRunning) {
+          if (this.rconService?.connected) {
+            const result = await this.rconService.getPlayers();
+            if (result?.success) {
+              const count = Array.isArray(result.players)
+                ? result.players.length
+                : 0;
+              const maxPlayers = await this.getConfiguredMaxPlayers();
+              activity = maxPlayers
+                ? this.presence.players
+                    .replace("{count}", String(count))
+                    .replace("{max}", String(maxPlayers))
+                : this.presence.playersNoMax.replace("{count}", String(count));
+            } else {
+              activity = this.presence.unavailable;
+            }
+          } else {
+            activity = this.presence.unavailable;
+          }
+        }
+
+        if (this.isRunning && this.client?.user) {
+          await this.client.user.setActivity(activity, {
+            type: ActivityType.Playing,
+          });
+        }
+      } catch (error) {
+        log.debug(`Discord presence update failed: ${error.message}`);
+      } finally {
+        this._presenceUpdateInFlight = null;
+      }
+    })();
+
+    return this._presenceUpdateInFlight;
+  }
+
+  _startPresenceUpdates() {
+    if (this._presenceInterval || !this.client?.user) return;
+    void this.updatePlayerPresence();
+    this._presenceInterval = setInterval(() => {
+      void this.updatePlayerPresence();
+    }, PLAYER_PRESENCE_INTERVAL_MS);
+  }
+
+  _stopPresenceUpdates() {
+    if (this._presenceInterval) {
+      clearInterval(this._presenceInterval);
+      this._presenceInterval = null;
+    }
+  }
+
+  // continuous-bug-hunt round 19 (token revoked while running): called only
+  // from the 'shardDisconnect' listener, which by construction only ever
+  // fires for an UNRECOVERABLE close code (see that listener's own comment)
+  // -- the gateway is confirmed dead and discord.js will not retry on its
+  // own. Puts the bot into the same terminal state stop() would, so a
+  // subsequent start() (after the operator fixes the token/intents and
+  // saves) can actually create a fresh client instead of being refused by
+  // start()'s own "already running" guard (`this.isRunning || this.client`)
+  // against a client that looks alive but never will be again.
+  _handleUnrecoverableShardDisconnect(code) {
+    // this._stopping: an intentional stop() destroys the client itself,
+    // which can fire this same event before stop() reaches its own
+    // isRunning=false a few lines down -- that is a clean, deliberate
+    // shutdown, not an unrecoverable failure, and must not be stamped with
+    // a misleading "Invalid token" lastStartError.
+    // !this.isRunning: already handled (e.g. two 'shardDisconnect' events
+    // in a row, or start() itself already failed and cleaned up).
+    if (this._stopping || !this.isRunning) return;
+
+    this.isRunning = false;
+    this._stopPresenceUpdates();
+
+    // AuthenticationFailed (4004) is exactly what Discord sends for a
+    // reset/revoked bot token -- reuse describeStartFailure()'s existing
+    // "TokenInvalid" copy ("Invalid token. Check the token below and save
+    // again.") so this reads the same whether the bad token was caught at
+    // start() or discovered later, mid-session. InvalidIntents (4013) /
+    // DisallowedIntents (4014) similarly reuse the existing intents
+    // message. The remaining unrecoverable codes (InvalidShard,
+    // ShardingRequired, InvalidAPIVersion) have no dedicated copy --
+    // describeStartFailure()'s own generic `lastStartError.message`
+    // fallback covers them.
+    const kind = code === 4004 ? "TokenInvalid" : code === 4013 || code === 4014 ? "DisallowedIntents" : null;
+    this.lastStartError = {
+      kind,
+      message: `Discord closed the connection permanently (code ${code}) and will not reconnect on its own.`,
+    };
+
+    if (this.logTailer && this._onGameChat) {
+      try {
+        this.logTailer.off("chatMessage", this._onGameChat);
+      } catch {
+        /* noop */
+      }
+      this._onGameChat = null;
+    }
+    if (this.logTailer && this._onServerStarted) {
+      try {
+        this.logTailer.off("serverStarted", this._onServerStarted);
+      } catch {
+        /* noop */
+      }
+      this._onServerStarted = null;
+    }
+
+    // The client object itself is a dead shell at this point -- null it out
+    // (matching stop()'s own cleanup) so start()'s "already running" guard
+    // doesn't refuse a fresh attempt once the operator fixes the config.
+    const deadClient = this.client;
+    this.client = null;
+    if (deadClient) {
+      deadClient
+        .destroy()
+        .catch((e) => log.debug(`Cleanup of dead Discord client failed: ${e.message}`));
+    }
+  }
+
+  async start() {
+    // Guard against double-start — calling start() twice would attach a
+    // second messageCreate listener and double-relay every Discord message
+    // into the game. Caller should stop() first if they want to restart.
+    if (this.isRunning || this.client) {
+      log.warn("start() called while bot is already running — ignoring");
+      return true;
+    }
+
+    // re-entrancy sweep, 2026-09-10 (HIGH #1): the check above is not
+    // enough on its own to stop a SECOND, near-simultaneous start() call --
+    // this.client isn't assigned until well after the first await
+    // (loadConfig(), right below) and this.isRunning not until later still
+    // (post-login, clientReady). Two overlapping start() calls both pass
+    // the check above before either assigns this.client, and both go on to
+    // create a Client and attach their own messageCreate listener, doubling
+    // every in-game chat relay message. Reachable two ways: a POST
+    // /discord/start double-click, AND PUT /discord/config's own internal
+    // restart-on-credential-change (routes/discord.js) calling start() a
+    // second way -- a guard covering only one of the two callers would
+    // still leave the other live, so this is claimed once, synchronously,
+    // right here in start() itself (both callers go through this same
+    // method), before the first await -- mirrors panelUpdateChecker.js's
+    // isDownloading.
+    if (this._starting) {
+      log.warn("start() called while a previous start() call is still in flight — ignoring");
+      return START_ALREADY_IN_PROGRESS;
+    }
+    this._starting = true;
+    try {
+      return await this._doStart();
+    } finally {
+      this._starting = false;
+    }
+  }
+
+  async _doStart() {
+    await this.loadConfig();
+
+    // If a previous stop() detached the chatMessage listener, reattach it
+    // now so the freshly started bot can relay in-game chat again.
+    if (this.logTailer && !this._onGameChat) {
+      this._onGameChat = (data) => this._queueGameChat(data);
+      this.logTailer.on("chatMessage", this._onGameChat);
+    }
+    // Same for the console "SERVER STARTED" marker that drives the Server
+    // Joinable notification.
+    if (this.logTailer && !this._onServerStarted) {
+      this._onServerStarted = () => this._handleServerStarted();
+      this.logTailer.on("serverStarted", this._onServerStarted);
+    }
+
+    if (!this.token) {
+      log.info("bot not configured (no token)");
+      this.lastStartError = { kind: "NoToken", message: "No bot token is configured." };
+      return false;
+    }
+
+    this.client = new Client({
+      intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.GuildMembers, // Required for role checks
+        GatewayIntentBits.MessageContent, // Required for reading chat messages
+      ],
+      // Never let bot-sent content ping anyone. The game->Discord chat relay
+      // and the {player} event notifications (join/leave/death/kick) carry
+      // player-controlled text. Literal @everyone/@here are already replaced
+      // with neutral text, but role/user mention syntax (<@&roleId>, <@userId>)
+      // is NOT — escapeMarkdown() doesn't touch it — so without this a player
+      // named "<@&adminRole>" (or typing it in chat) could ping Discord roles.
+      // The bot never needs to ping, so disable all mention parsing globally.
+      allowedMentions: { parse: [] },
+      // Route the client's INTERNAL REST (login, message sends, interaction
+      // replies, chat relay, notifications) through the same undici-safe
+      // wrapper used for slash-command registration. Without this, only the
+      // manually-created REST instances were patched, so any dashboard-driven
+      // action (Send Test Message, event notifications, Discord→game relay)
+      // still hit the undici 8.x Symbol(sensitiveHeaders) crash on Node 22+/24+.
+      rest: { makeRequest: _safeDiscordMakeRequest },
+    });
+
+    // Two-way Chat Bridge: Discord -> Server
+    // Rate-limited per Discord user to prevent in-game chat spam: max 5
+    // messages per 10-second window. Excess messages are silently dropped.
+    const CHAT_BRIDGE_LIMIT = 5;
+    const CHAT_BRIDGE_WINDOW_MS = 10_000;
+    const chatBridgeRate = new Map(); // userId -> [timestamps]
+    this.client.on("messageCreate", async (message) => {
+      // Ignore stats from bots (including self) or if bot is stopped
+      if (!this.isRunning || message.author.bot) return;
+      // Ignore Discord system messages (pin notifications, member joins,
+      // boost messages, etc.) — these have empty content and would relay
+      // as `<username>: ` to in-game chat.
+      if (message.system) return;
+
+      // The relay switch covers the whole bridge. Leaving this direction live
+      // meant turning the relay off still piped Discord chatter into the game.
+      if (!this.chatRelayEnabled) return;
+
+      // SECURITY (2026-10-05, HT4b): only from the guild the panel is set up
+      // for, as handleInteraction() answers commands (D2). The channel check
+      // below matched an ID alone, so a channel the bot can see in another
+      // guild -- one it was moved away from, say -- relayed into the game
+      // as "[Discord] name: text" through RCON servermsg, which the panel's
+      // own POST /server/message gates behind server.world_events.
+      if (
+        !this.guildId ||
+        String(message.guildId ?? "") !== String(this.guildId)
+      ) {
+        return;
+      }
+
+      // Use the dedicated relay channel in both directions when configured.
+      const relayChannelId = this.chatRelayChannelId || this.channelId;
+      if (!relayChannelId) return;
+      if (message.channelId === relayChannelId) {
+        try {
+          // Check if RCON is connected
+          if (this.rconService && this.rconService.connected) {
+            const user = message.author.username;
+            const userId = message.author.id;
+            // Sanitize content: remove newlines and double quotes to prevent command injection/formatting issues
+            let content = message.content;
+            if (!content) return; // Ignore empty messages (images etc)
+
+            // Rate-limit per Discord user
+            const now = Date.now();
+            const hits = (chatBridgeRate.get(userId) || []).filter(
+              (t) => now - t < CHAT_BRIDGE_WINDOW_MS,
+            );
+            if (hits.length >= CHAT_BRIDGE_LIMIT) {
+              log.debug(`Chat bridge rate-limited user ${user} (${userId})`);
+              return;
+            }
+            hits.push(now);
+            chatBridgeRate.set(userId, hits);
+            // Opportunistic GC so the map doesn't grow unbounded
+            if (chatBridgeRate.size > 200) {
+              for (const [id, ts] of chatBridgeRate) {
+                if (!ts.some((t) => now - t < CHAT_BRIDGE_WINDOW_MS))
+                  chatBridgeRate.delete(id);
+              }
+            }
+
+            // Resolve Discord mention/channel/emoji tokens to readable text
+            // so PZ in-game chat doesn't show ugly `<@123456789>` blobs.
+            let resolved = content
+              // User mentions: <@id> or <@!id>
+              .replace(/<@!?(\d+)>/g, (_, id) => {
+                const u = message.mentions?.users?.get(id);
+                return u ? `@${u.username}` : "@user";
+              })
+              // Role mentions: <@&id>
+              .replace(/<@&(\d+)>/g, (_, id) => {
+                const r = message.mentions?.roles?.get(id);
+                return r ? `@${r.name}` : "@role";
+              })
+              // Channel mentions: <#id>
+              .replace(/<#(\d+)>/g, (_, id) => {
+                const c = message.mentions?.channels?.get(id);
+                return c ? `#${c.name}` : "#channel";
+              })
+              // Custom emoji: <:name:id> or <a:name:id>
+              .replace(/<a?:([^:>]+):\d+>/g, ":$1:");
+
+            // serverMessage() sanitizes control chars internally; we cap lengths here
+            // to prevent overlong RCON messages from high-entropy Discord usernames/content
+            const safeUser = user.slice(0, 50);
+            const safeMsg = resolved.replace(/[\r\n]+/g, " ").slice(0, 200);
+            if (!safeMsg.trim()) return; // mentions-only message after stripping
+            const relayed = await this.rconService.serverMessage(
+              `[Discord] ${safeUser}: ${safeMsg}`,
+            );
+            // Being connected is not the same as the command succeeding, and a
+            // silent drop is exactly what the offline notice exists to prevent.
+            if (!relayed?.success) {
+              const now = Date.now();
+              if (now - this._bridgeOfflineNoticeAt > 60_000) {
+                this._bridgeOfflineNoticeAt = now;
+                await message.reply(
+                  "⚠️ The game server rejected that message, so it was not delivered in-game.",
+                );
+              }
+            }
+          } else {
+            const now = Date.now();
+            if (now - this._bridgeOfflineNoticeAt > 60_000) {
+              this._bridgeOfflineNoticeAt = now;
+              await message.reply(
+                "⚠️ The game server is unreachable right now, so that message was not delivered in-game.",
+              );
+            }
+          }
+        } catch (e) {
+          log.warn(`Failed to bridge message to server: ${e.message}`);
+        }
+      }
+    });
+
+    this.client.on("interactionCreate", async (interaction) => {
+      try {
+        await this.handleInteraction(interaction);
+      } catch (error) {
+        log.error(`interaction handler error: ${error.message}`);
+      }
+    });
+
+    this.client.on("error", (error) => {
+      log.error(`client error: ${error.stack || error.message}`);
+    });
+
+    // See the _gatewayDegradedSince comment in the constructor for why these
+    // four specifically (not shardError, which fires for transport errors
+    // that don't necessarily change connection state on their own).
+    this.client.on("shardReconnecting", () => {
+      if (!this._gatewayDegradedSince) this._gatewayDegradedSince = Date.now();
+    });
+    this.client.on("shardDisconnect", (event) => {
+      if (!this._gatewayDegradedSince) this._gatewayDegradedSince = Date.now();
+      log.error(
+        `Discord gateway shard disconnected and will not reconnect on its own (code ${event?.code}).`,
+      );
+      // continuous-bug-hunt round 19 (token revoked while running): djs's
+      // own WebSocketManager only ever emits 'shardDisconnect' for its
+      // UNRECOVERABLE_CLOSE_CODES set (AuthenticationFailed=4004 --
+      // exactly what Discord sends when the bot's token has been reset or
+      // revoked -- plus InvalidShard/ShardingRequired/InvalidAPIVersion/
+      // InvalidIntents/DisallowedIntents), confirmed by reading
+      // node_modules/discord.js/src/client/websocket/WebSocketManager.js
+      // directly: this event, by construction, ONLY ever fires when the
+      // shard is confirmed dead and will not reconnect on its own -- never
+      // for an ordinary blip (those go through shardReconnecting instead).
+      // Before this fix, `this.isRunning` stayed true forever after this
+      // fired: getStatus() kept reporting a "healthy" running:true bot,
+      // and the only visible signal was the generic gatewayIssue banner
+      // ("...may be delayed until it recovers") -- actively misleading for
+      // a revoked token, since this connection will NEVER recover without
+      // the operator entering a new token and restarting the bot.
+      this._handleUnrecoverableShardDisconnect(event?.code);
+    });
+    this.client.on("shardResume", () => {
+      this._gatewayDegradedSince = null;
+    });
+    this.client.on("shardReady", () => {
+      this._gatewayDegradedSince = null;
+    });
+
+    try {
+      // Await the 'clientReady' event so that isRunning === true before start() returns.
+      // client.login() resolves when the WebSocket authenticates; 'clientReady' fires after.
+      await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          const timeoutError = new Error("Bot ready timeout after 30s");
+          timeoutError.code = "ReadyTimeout";
+          reject(timeoutError);
+        }, 30000);
+        this.client.once("clientReady", async () => {
+          clearTimeout(timeout);
+          log.info(`bot logged in as ${this.client.user.tag}`);
+          try {
+            await this.registerCommands();
+          } catch (e) {
+            log.warn(`Failed to register slash commands: ${e.message}`);
+          }
+          this.isRunning = true;
+          this.lastStartError = null;
+          this._startPresenceUpdates();
+          resolve();
+        });
+        this.client.login(this.token).catch((err) => {
+          clearTimeout(timeout);
+          reject(err);
+        });
+      });
+      return true;
+    } catch (error) {
+      log.error(`Failed to start Discord bot: ${error.message}`);
+      // "kind", not "code" -- this never reaches the client as a response
+      // code (routes/discord.js only reads it to choose which plain-text
+      // message to send), so it's outside the ErrorCode registry's remit
+      // (server/utils/errorCodes.js) despite mirroring discord.js's own
+      // internal error codes (TokenInvalid, DisallowedIntents, ...).
+      this.lastStartError = { kind: error.code || null, message: error.message };
+      if (this.logTailer && this._onGameChat) {
+        try {
+          this.logTailer.off("chatMessage", this._onGameChat);
+        } catch {
+          /* noop */
+        }
+        this._onGameChat = null;
+      }
+      if (this.logTailer && this._onServerStarted) {
+        try {
+          this.logTailer.off("serverStarted", this._onServerStarted);
+        } catch {
+          /* noop */
+        }
+        this._onServerStarted = null;
+      }
+      if (this.client) {
+        try {
+          this.client.destroy();
+        } catch (destroyError) {
+          log.debug(`Discord client destroy failed: ${destroyError.message}`);
+        }
+        this.client = null;
+      }
+      this.isRunning = false;
+      this._stopPresenceUpdates();
+      return false;
+    }
+  }
+  async stop() {
+    // See the constructor's own comment on this flag: client.destroy()
+    // below closes the gateway itself, which can fire 'shardDisconnect'
+    // before this function reaches its own isRunning=false a few lines
+    // down -- without this flag that in-flight event would be treated as
+    // an unrecoverable disconnect (revoked token, ...) instead of the
+    // deliberate stop it actually is.
+    this._stopping = true;
+    try {
+      this._stopPresenceUpdates();
+      // Invalidate work queued before this lifecycle boundary even when a
+      // failed start already destroyed the client. Otherwise a later start can
+      // relay stale game chat or commit stale lifecycle dedupe state.
+      this._chatRelayGeneration++;
+      this._chatRelayChain = Promise.resolve();
+      this._chatRelayPending = 0;
+      this._chatRelayDropped = 0;
+      this._lifecycleNotificationGeneration++;
+      this._lifecycleNotificationChain = Promise.resolve();
+      // Detach the chatMessage listener so a swapped LogTailer (e.g. a
+      // restart of the panel-managed game-server changes the tailer instance)
+      // doesn't leak handlers across bot lifecycles. Done outside the client
+      // check because a failed start() leaves the listener attached with no
+      // client to go with it.
+      if (this.logTailer && this._onGameChat) {
+        try {
+          this.logTailer.off("chatMessage", this._onGameChat);
+        } catch {
+          /* noop */
+        }
+        this._onGameChat = null;
+      }
+      if (this.logTailer && this._onServerStarted) {
+        try {
+          this.logTailer.off("serverStarted", this._onServerStarted);
+        } catch {
+          /* noop */
+        }
+        this._onServerStarted = null;
+      }
+      if (this.client) {
+        await this.client.destroy();
+        this.client = null;
+        this.isRunning = false;
+        // Reset lifecycle dedupe so the next bot session can fire a fresh
+        // serverStart/serverStop without being suppressed by the previous run.
+        this._lastLifecycleState = null;
+        this._lastLifecycleAt = 0;
+        // Reset breaker state too — stale failure counts shouldn't carry over.
+        this._channelBreakers.clear();
+        this._gatewayDegradedSince = null;
+        // Drop registration tracking; a fresh start() should re-register.
+        this._registerInFlight = null;
+        this._registeredGuildId = null;
+        log.info("bot stopped");
+      }
+    } finally {
+      this._stopping = false;
+    }
+  }
+
+  getStatus() {
+    // Debounced, not raw: a shardReconnecting-to-shardResume/shardReady
+    // round trip well under this threshold is exactly what a healthy
+    // connection recovering from a normal blip looks like (see suspect 4's
+    // proof) — surfacing that to the operator every time would train them
+    // to ignore the signal, which is worse than not having it.
+    const gatewayIssue = Boolean(
+      this._gatewayDegradedSince &&
+        Date.now() - this._gatewayDegradedSince >= GATEWAY_DEGRADED_THRESHOLD_MS,
+    );
+    return {
+      running: this.isRunning,
+      configured: !!this.token,
+      username: this.client?.user?.tag || null,
+      guildId: this.guildId,
+      channelId: this.channelId,
+      modRoleId: this.modRoleId || null,
+      // Channels the bot stopped posting to because they aren't in the
+      // configured guild (M2): 1.4.5 posted there, so the Discord page says
+      // why notifications stopped instead of leaving it to the panel log.
+      channelsOutsideGuild: [...this._outsideGuildRefusals.keys()],
+      // Persists past the one-time toast POST /start already shows, so a
+      // user who navigates away and comes back still sees why the last
+      // start attempt failed -- cleared the moment a start actually
+      // succeeds (see the clientReady handler in start()).
+      lastStartError: this.lastStartError
+        ? { kind: this.lastStartError.kind, message: describeStartFailure(this.lastStartError) }
+        : null,
+      // gatewayDegradedSince is the raw episode-start timestamp (ISO string,
+      // or null when healthy) -- the client uses it as the dismissal key so
+      // dismissing THIS episode doesn't silence a later, different one.
+      gatewayIssue,
+      gatewayDegradedSince: gatewayIssue
+        ? new Date(this._gatewayDegradedSince).toISOString()
+        : null,
+    };
+  }
+}

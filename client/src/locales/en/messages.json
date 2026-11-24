@@ -1,0 +1,89 @@
+{
+  "shared": {
+    "errorTitle": "Error",
+    "successTitle": "Success"
+  },
+  "page": {
+    "title": "Messages",
+    "description": "Send server event notifications by SMS to one or more phone numbers.",
+    "loading": "Loading SMS settings..."
+  },
+  "status": {
+    "enabled": "SMS enabled",
+    "disabled": "SMS disabled"
+  },
+  "provider": {
+    "title": "SMS provider",
+    "description": "Choose how messages leave the panel. Twilio works worldwide; a custom HTTP gateway fits local Egyptian SMS providers.",
+    "enabledLabel": "Enable SMS notifications",
+    "enabledHint": "When off, no event messages are sent. Test messages still work so you can verify the setup.",
+    "providerLabel": "Provider",
+    "twilio": "Twilio",
+    "http": "Custom HTTP gateway",
+    "senderName": "Sender name",
+    "senderNameHint": "Shown in message text and used as the sender ID where your provider supports it.",
+    "accountSid": "Twilio Account SID",
+    "from": "From number or sender ID",
+    "fromHint": "A Twilio phone number in +country format, or a registered 11-character alphanumeric sender ID.",
+    "authToken": "Auth token / API key",
+    "authTokenStored": "A secret is already stored. Leave blank to keep it.",
+    "authTokenPlaceholder": "Paste the Twilio auth token",
+    "apiKeyPlaceholder": "Paste the gateway API key",
+    "clearSecret": "Clear the stored secret",
+    "httpUrl": "Gateway URL template",
+    "httpUrlHint": "Placeholders {to}, {message}, {sender} and {key} are URL-encoded before sending. {to} and {message} are required.",
+    "httpMethod": "HTTP method",
+    "save": "Save provider",
+    "saving": "Saving...",
+    "saved": "Provider settings saved."
+  },
+  "test": {
+    "title": "Test message",
+    "description": "Edit the text below and send it to one number or every enabled number to verify the provider.",
+    "messageLabel": "Test message",
+    "messagePlaceholder": "Type the message you want to receive",
+    "sendTo": "Send to",
+    "allRecipients": "All enabled numbers",
+    "saveMessage": "Save message",
+    "savedMessage": "Test message saved.",
+    "send": "Send test SMS",
+    "sending": "Sending...",
+    "sent": "Test SMS sent."
+  },
+  "recipients": {
+    "title": "Phone numbers",
+    "description": "Every enabled number receives each enabled event notification.",
+    "hint": "Egyptian mobiles can be entered as 01xxxxxxxxx; they are stored in international format (+20...). Other countries need a + prefix.",
+    "empty": "No phone numbers yet. Add one to start receiving notifications.",
+    "label": "Label",
+    "labelPlaceholder": "e.g. Owner",
+    "phone": "Phone number",
+    "phonePlaceholder": "01xxxxxxxxx",
+    "enabled": "Enabled",
+    "remove": "Remove",
+    "add": "Add number",
+    "save": "Save numbers",
+    "saving": "Saving...",
+    "saved": "Phone numbers saved."
+  },
+  "events": {
+    "title": "Event notifications",
+    "description": "These are the same events as the Discord bot's notifications. Each one is sent as a plain-text SMS.",
+    "variables": "Variables",
+    "none": "None",
+    "enabled": "Enabled",
+    "preview": "Preview",
+    "sendTest": "Send test",
+    "sent": "Test event SMS sent.",
+    "save": "Save event settings",
+    "saving": "Saving...",
+    "saved": "Event notification settings saved."
+  },
+  "errors": {
+    "noPermissionTitle": "Read-only",
+    "noPermission": "You need the Integrations permission to change SMS settings.",
+    "load": "Could not load SMS settings.",
+    "save": "Could not save SMS settings.",
+    "test": "Could not send the test SMS."
+  }
+}

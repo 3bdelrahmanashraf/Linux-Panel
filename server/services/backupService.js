@@ -1,0 +1,2239 @@
+import path from "path";
+import fs from "fs";
+import { createWriteStream } from "fs";
+import archiver from "archiver";
+import { createReadStream } from "fs";
+import { crc32 } from "zlib";
+import { randomUUID } from "crypto";
+import { createLogger } from "../utils/logger.js";
+import { escapeRegExp } from "../utils/regex.js";
+import { isPidAlive } from "../utils/pidLiveness.js";
+const log = createLogger("Backup");
+import {
+  getActiveServer,
+  getServers,
+  getSetting,
+  setSetting,
+  logServerEvent,
+  getLatestScheduleExecutionByCommand,
+  flushWrites,
+} from "../database/init.js";
+import { sanitizeError } from "../utils/sanitize.js";
+import {
+  RESTORE_ROLLBACK_FAILED_PREFIX,
+  publicRestoreMessage,
+} from "../utils/restoreMessage.js";
+import { captureBackupSnapshot } from "../utils/backupSnapshot.js";
+import {
+  describeRefusal,
+  logRefusalOnce,
+  zomboidDataFolderHolds,
+  zomboidDataFolderRefusal,
+} from "./zomboidDataPath.js";
+import {
+  addBackupRecord,
+  listBackupRecords,
+  removeBackupRecord,
+} from "./backupRecords.js";
+import { invalidateMapFolderScan } from "../routes/chunks.js";
+import {
+  isCronTooFrequent,
+  isSupportedFiveFieldCron,
+} from "../utils/cronValidation.js";
+import { LEGACY_RESTART_SKIP_MESSAGE } from "../utils/backupRestartOverlap.js";
+
+// Dynamic import for unzipper (CommonJS module)
+let unzipper;
+async function getUnzipper() {
+  if (!unzipper) {
+    unzipper = await import("unzipper");
+  }
+  return unzipper;
+}
+
+// The shape a page may pick for its own restore's id (see restoreBackup()'s
+// currentRestore/lastRestore comment) -- anything else gets a server-made
+// one. It is echoed back in GET /backup/status, so it stays short and plain.
+const RESTORE_REQUEST_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
+
+async function* walkDirectory(rootDir) {
+  const pending = [{ dirPath: rootDir, archivePath: "", isRoot: true }];
+
+  while (pending.length > 0) {
+    const current = pending.pop();
+    let directory;
+    try {
+      directory = await fs.promises.opendir(current.dirPath);
+    } catch (error) {
+      if (current.isRoot) throw error;
+      continue;
+    }
+
+    try {
+      let entry;
+      while ((entry = await directory.read()) !== null) {
+        const archivePath = current.archivePath
+          ? `${current.archivePath}/${entry.name}`
+          : entry.name;
+        const fullPath = path.join(current.dirPath, entry.name);
+
+        if (entry.isSymbolicLink()) {
+          // Deliberately not followed (zip-slip in reverse -- a symlink
+          // inside the save tree pointing outside it must never leak
+          // arbitrary filesystem content into the archive), but that
+          // decision has to be VISIBLE the same way a vanished file already
+          // is via waitForArchiveEntry's ENOENT handling below -- silently
+          // dropping it here meant a pre-restore/pre-wipe backup could be
+          // incomplete with skippedFiles staying empty, defeating the
+          // "any skip is a failure" policy those call sites rely on.
+          yield { entry, fullPath, archivePath, isSymlink: true };
+          continue;
+        }
+
+        if (entry.isDirectory()) {
+          pending.push({
+            dirPath: fullPath,
+            archivePath,
+            isRoot: false,
+          });
+        }
+
+        yield { entry, fullPath, archivePath };
+      }
+    } finally {
+      await directory.close().catch(() => {});
+    }
+  }
+}
+
+async function countFiles(rootDir) {
+  let count = 0;
+  for await (const { entry } of walkDirectory(rootDir)) {
+    if (!entry.isDirectory()) count++;
+  }
+  return count;
+}
+
+// Orphan temp sweep, hunt-wave11-2026-08-29 follow-up. Dwight found this
+// while copying this function as the model for fileWriteQueue.js's own
+// sweep (531dfd8d) -- his copy came out stronger than the original.
+// cleanupOrphanBackupTemps deleted on FILENAME PATTERN ALONE, with no check
+// that the process which created a match is actually gone. Safe TODAY only
+// because backups are effectively single-flight -- an assumption resting
+// OUTSIDE this function rather than a guarantee inside it. If concurrent
+// backups ever become possible, this deleted a live backup's temp with no
+// warning.
+//
+// Applies the shared isPidAlive() helper (utils/pidLiveness.js) exactly:
+// any outcome other than a confirmed ESRCH (including EPERM, a pid this
+// process cannot signal) is treated as "still alive" -- an ambiguous
+// signal never authorises a delete. fileWriteQueue.js's writeFileAtomic
+// sweep applies the same helper to its own, differently-shaped pattern
+// (hunt-wave12, 2026-08-30: unifies what used to be two duplicated copies
+// of this pid-liveness check, one per file).
+//
+// The two patterns THIS function sweeps do NOT uniformly embed a pid, so
+// this deliberately does NOT force one sweep mechanism onto both (that
+// generalisation is what Dwight correctly deferred rather than inventing,
+// and unifying the pid-liveness check above does not change that):
+//   - .central-{pid}-{timestamp}-{random}.tmp (StreamingZipWriter's own
+//     centralPath, server/utils/streamingZip.js) DOES embed a pid as its
+//     first segment, extracted and liveness-checked below.
+//   - *.zip.tmp (`${backupPath}.tmp`, this file's own createBackup) has NO
+//     pid anywhere in its name. There is no liveness check to run without
+//     changing that naming scheme, which is a separate, larger change than
+//     this card's scope -- left exactly as before (pattern-only deletion),
+//     still resting on the single-flight assumption above. Deliberately
+//     NOT given a false sense of safety by bolting a liveness check onto a
+//     name that cannot carry one.
+const CENTRAL_TEMP_PATTERN = /^\.central-(\d+)-\d+-[0-9a-z]+\.tmp$/;
+
+// Exported alias, not a fresh implementation: kept so this sweep's own
+// tests and callers can name the check in domain terms (is the temp
+// file's *owner* still alive) without every caller needing to know the
+// underlying check is now shared with fileWriteQueue.js.
+export const isBackupTempOwnerAlive = isPidAlive;
+
+export function cleanupOrphanBackupTemps(backupsPath) {
+  let entries;
+  try {
+    entries = fs.readdirSync(backupsPath);
+  } catch {
+    return;
+  }
+  for (const name of entries) {
+    const centralMatch = CENTRAL_TEMP_PATTERN.exec(name);
+    if (centralMatch) {
+      if (isBackupTempOwnerAlive(Number(centralMatch[1]))) continue;
+    } else if (!name.endsWith(".zip.tmp")) {
+      continue;
+    }
+    try {
+      fs.unlinkSync(path.join(backupsPath, name));
+      log.info(`Removed orphan backup temporary file: ${name}`);
+    } catch (error) {
+      log.debug(`Could not remove orphan backup temporary file ${name}: ${error.message}`);
+    }
+  }
+}
+
+// 2026-08-26 bug hunt: used to resolve with nothing (undefined) on BOTH a
+// genuine "entry" success and an ENOENT warning (a file that vanished
+// between the initial scan and archiving -- a real race on a live PZ
+// directory, since the game process rotates/deletes temp files, logs and
+// lock files while a backup can be mid-scan). That made the two outcomes
+// indistinguishable to every caller, so a silently-dropped file left zero
+// trace anywhere -- createBackup resolved success:true regardless of how
+// many files were actually skipped. Now resolves { skipped: boolean } so
+// callers can track precisely which archive entries made it in and which
+// didn't, entry by entry, with no separate bookkeeping needed: every path
+// that adds anything to the archive already goes through this function.
+export function waitForArchiveEntry(archive, append) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+
+    const cleanup = () => {
+      archive.off("entry", onEntry);
+      archive.off("error", onError);
+      archive.off("warning", onWarning);
+    };
+
+    const settle = (handler, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      handler(value);
+    };
+
+    const onEntry = () => settle(resolve, { skipped: false });
+    const onError = (error) => settle(reject, error);
+    const onWarning = (error) => {
+      if (error.code === "ENOENT") {
+        settle(resolve, { skipped: true });
+      } else {
+        settle(reject, error);
+      }
+    };
+
+    archive.on("entry", onEntry);
+    archive.on("error", onError);
+    archive.on("warning", onWarning);
+
+    try {
+      append();
+    } catch (error) {
+      settle(reject, error);
+    }
+  });
+}
+
+// Returns the archive-relative paths of any entries that were skipped --
+// either vanished between the scan and the archive pass, or a symbolic
+// link deliberately not followed -- rather than swallowing that
+// information the way the caller used to have no way to find out.
+export async function appendDirectoryToArchive(archive, sourceRoot, destinationRoot) {
+  const skipped = [];
+  for await (const { entry, fullPath, archivePath, isSymlink } of walkDirectory(
+    sourceRoot,
+  )) {
+    const entryName = `${destinationRoot}/${archivePath}${entry.isDirectory() ? "/" : ""}`;
+    if (isSymlink) {
+      log.warn(`Skipping symbolic link during backup: ${fullPath}`);
+      skipped.push(entryName);
+      continue;
+    }
+    const result = await waitForArchiveEntry(archive, () =>
+      archive.file(fullPath, { name: entryName }),
+    );
+    if (result.skipped) skipped.push(entryName);
+  }
+  return skipped;
+}
+
+// Sort key for listBackups(): panel-created backups encode their own
+// creation timestamp (down to the millisecond) plus a numeric collision
+// suffix directly in the filename -- see the timestamp/collision-suffix
+// construction in _doCreateBackup(). Parsing that out and sorting on it,
+// the same fix already applied to configBackup.js's listBackupsFor() (see
+// its own comment), avoids relying on fs.stat().birthtime: several backups
+// created in quick succession (a fast/near-empty world backs up in well
+// under a second) can land with an IDENTICAL birthtime on real
+// filesystems, at which point Array.prototype.sort's stability falls back
+// to readdir()'s order -- unrelated to creation order -- and the brand-new
+// backup can be mistaken for the oldest and pruned instead of a genuinely
+// older one. Falls back to birthtime only for names the panel didn't
+// create this way (uploaded-*.zip, hand-copied files) -- there is no
+// better signal for those, and they're already exempt from automatic
+// pruning regardless.
+// The exact shape _doCreateBackup() writes (see its own timestamp/
+// collision-suffix construction): `new Date().toISOString()` with `:`/`.`
+// swapped for `-` and sliced to 23 chars (drops the trailing "Z"), plus an
+// optional `-N` collision suffix. Kept as one shared string so
+// BACKUP_TIMESTAMP_RE below and round 18b's per-server ownership pattern
+// (backupFilenameOwnerPattern()) can never drift apart on what a real
+// panel-written timestamp looks like.
+const BACKUP_TIMESTAMP_PATTERN =
+  "\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}-\\d{3}";
+const BACKUP_TIMESTAMP_RE = new RegExp(
+  `(${BACKUP_TIMESTAMP_PATTERN})(?:-(\\d+))?\\.zip$`,
+);
+function backupSortKey(fileName, stats) {
+  const match = fileName.match(BACKUP_TIMESTAMP_RE);
+  if (match) {
+    return { key: match[1], suffix: match[2] ? parseInt(match[2], 10) : 1 };
+  }
+  return {
+    key: stats.birthtime.toISOString().replace(/[:.]/g, "-").slice(0, 23),
+    suffix: 1,
+  };
+}
+
+// round 18b (god-caught follow-up): a plain name.startsWith(`${name}_`)
+// substring check is not enough to attribute a backup's filename to a
+// server -- SERVER_NAME_REGEX allows underscores, so two configured
+// servers "my" and "my_server" sharing a backups folder both look like
+// they "start with" my_server's own file (my_server_2026-...zip starts
+// with "my_" too), misattributing my_server's own backup as belonging to
+// "my" and hiding/refusing it as foreign. Anchoring the WHOLE filename --
+// `${name}_` immediately followed by the exact BACKUP_TIMESTAMP_PATTERN
+// shape and nothing else -- closes that: "my_server_2026-...zip" only
+// matches candidate "my_server" (nothing valid follows "my_" except
+// "server_2026...", which is not a 4-digit year), never candidate "my".
+function backupFilenameOwnerPattern(serverName) {
+  return new RegExp(
+    `^${escapeRegExp(serverName)}_${BACKUP_TIMESTAMP_PATTERN}(?:-\\d+)?\\.zip$`,
+  );
+}
+
+// Attributes `fileName` to exactly one of `candidateNames`: whichever
+// candidate's anchored pattern matches AND is the LONGEST such match wins,
+// so a longer, more specific name (e.g. "my_server") is never shadowed by
+// a shorter one that happens to be a literal prefix of it (e.g. "my").
+// Callers put the ACTIVE server's own name in `candidateNames` alongside
+// any colliding others, so ties always resolve in favor of a real name
+// (two different currently-configured servers can never share the exact
+// same name) and the active server's own file is never misattributed to
+// someone else as a side effect of this length comparison. Returns null
+// when NO candidate's pattern matches at all -- a legacy backup predating
+// multi-server support, an uploaded archive, or simply a name matching no
+// known server -- callers treat "no clear owner" as "assume mine, don't
+// hide or refuse it", the same conservative default the rest of this
+// round's fix already uses.
+function attributeBackupFilename(fileName, candidateNames) {
+  let winner = null;
+  for (const name of candidateNames) {
+    if (backupFilenameOwnerPattern(name).test(fileName)) {
+      if (!winner || name.length > winner.length) winner = name;
+    }
+  }
+  return winner;
+}
+
+// Create the restore staging directory next to the live save (security
+// audit M4). The name is random and mkdir is non-recursive (EEXIST = try a
+// new name), and the created directory is verified to be a real directory
+// that resolves inside the saves parent -- the old Date.now()-pid name plus
+// recursive mkdir followed a pre-planted symlink, while the zip-slip guard
+// in restoreBackup() is lexical and stayed inside the symlink path.
+// makeName is injectable for tests only.
+export function createRestoreStagingDir(savesParentPath, makeName = randomUUID) {
+  let stagingPath;
+  for (let attempt = 0; ; attempt++) {
+    stagingPath = path.join(savesParentPath, `.restore-staging-${makeName()}`);
+    try {
+      fs.mkdirSync(stagingPath, { recursive: false });
+      break;
+    } catch (error) {
+      if (error.code === "EEXIST" && attempt < 5) continue;
+      throw error;
+    }
+  }
+  try {
+    if (!fs.lstatSync(stagingPath).isDirectory()) {
+      throw new Error("Cannot restore: staging path is not a directory");
+    }
+    const realSavesParent = fs.realpathSync(savesParentPath);
+    if (fs.realpathSync(stagingPath) !== path.join(realSavesParent, path.basename(stagingPath))) {
+      throw new Error("Cannot restore: staging directory resolves outside the saves folder");
+    }
+  } catch (error) {
+    // The caller never receives this path, so it cannot clean it up. Remove
+    // only the entry itself: unlink a link, rmdir an (empty) directory --
+    // never anything recursive that could follow it.
+    try {
+      if (fs.lstatSync(stagingPath).isSymbolicLink()) fs.unlinkSync(stagingPath);
+      else fs.rmdirSync(stagingPath);
+    } catch {
+      /* best effort */
+    }
+    throw error;
+  }
+  return stagingPath;
+}
+
+// The Socket.IO room backup:progress, restore:progress and restore:finished
+// go to (server/index.js's CAPABILITY_ROOMS gates who may join it). They
+// used to go to every connected socket, whatever its role, with raw error
+// text that can quote host paths.
+export const BACKUP_PROGRESS_ROOM = "backups";
+
+// SECURITY (2026-10-05, PATHS-1): backups read the world save under a
+// server's Zomboid data folder and list, write, restore and delete in its
+// backups/ folder, so that folder is held to the data-folder rule
+// (services/zomboidDataPath.js) again here, where it is used: one saved
+// before the rule existed, or one that didn't exist when it was saved and
+// has appeared since, is refused -- never swapped for the legacy setting's
+// or the panel's own folder.
+//
+// A remote server's data folder is on its own host, so none of it is here:
+// no saves or backups folder resolves for one (getSavesPath() and
+// _resolveServerDataBasePath() return null), not the legacy setting's or
+// the panel's own either. Remote records skip the save-time rule for that
+// reason, so passing them through here let servers.manage name any folder
+// on this computer as a remote server's data folder and have backups create
+// <folder>/backups and list, download and delete the .zip files in it.
+function dataFolderUsable(server, dataPath) {
+  if (server?.isRemote) return false;
+  if (zomboidDataFolderHolds(dataPath)) return true;
+  // PT5: once per folder at warn, then debug -- GET /status lands here up
+  // to three times a call, and the Backups page polls it.
+  logRefusalOnce(
+    log,
+    `Not using ${dataPath} for backups: ${describeRefusal(zomboidDataFolderRefusal())}`,
+  );
+  return false;
+}
+
+// The text routes/backup.js sends with BACKUP_REMOTE_NOT_AVAILABLE, for the
+// scheduled backup job, which reaches createBackup() without the route.
+const REMOTE_BACKUPS_MESSAGE =
+  "Backups are not available for remote servers. The server filesystem is not accessible from this panel.";
+
+export class BackupService {
+  constructor() {
+    this.backupInProgress = false;
+    this.restoreInProgress = false;
+    // The restore running right now and the one that ran last, as
+    // restoreBackup() records them -- see that method's comment.
+    this.currentRestore = null;
+    this.lastRestore = null;
+    this.lastBackup = null;
+    this.backupHistory = [];
+    this.discordBot = null;
+    this.serverManager = null;
+    this.scheduler = null;
+  }
+
+  /**
+   * Get the saves folder path for the current server
+   */
+
+  setDiscordBot(discordBot) {
+    this.discordBot = discordBot;
+  }
+
+  setServerManager(serverManager) {
+    this.serverManager = serverManager;
+  }
+
+  // Read-only from here: only ever consulted for its .restartInProgress
+  // flag (see createBackup()'s guard), never mutated through this
+  // reference.
+  setScheduler(scheduler) {
+    this.scheduler = scheduler;
+  }
+
+  /**
+   * Get the saves folder path for the current server.
+   *
+   * lifecycle-lock-set sweep, 2026-09-07: `activeServerOverride` lets a
+   * caller that already resolved getActiveServer() (createBackup(), which
+   * also needs the same server for getBackupsPath() and the backup's
+   * filename label) reuse that single fresh read instead of each callee
+   * re-querying the DB independently -- a concurrent /servers/:id/activate
+   * landing between three independent reads could otherwise put the
+   * archive's DATA under one server's save folder while its FILENAME
+   * labels a different server (Kevin's finding, backup-restore lane).
+   * Every other existing caller (getStatus(), routes/backup.js's listing
+   * routes, /wipe's pre-wipe backup path resolution) passes nothing, so
+   * `activeServerOverride` stays `undefined` there and this falls back to
+   * its own always-fresh read exactly as before -- byte-identical
+   * behavior for every call site that isn't createBackup().
+   */
+  async getSavesPath(activeServerOverride) {
+    /**
+     * (getSavesPath starts here)
+     */
+    try {
+      const activeServer =
+        activeServerOverride !== undefined
+          ? activeServerOverride
+          : await getActiveServer();
+
+      // PATHS-1: see dataFolderUsable() -- nothing of a remote server's is here.
+      if (activeServer?.isRemote) return null;
+
+      if (activeServer?.zomboidDataPath && activeServer?.serverName) {
+        if (!dataFolderUsable(activeServer, activeServer.zomboidDataPath)) return null;
+        const savesPath = path.join(
+          activeServer.zomboidDataPath,
+          "Saves",
+          "Multiplayer",
+          activeServer.serverName,
+        );
+        if (fs.existsSync(savesPath)) {
+          return savesPath;
+        }
+        // Try without serverName subfolder - but only if the folder matches the expected name
+        const baseSavesPath = path.join(
+          activeServer.zomboidDataPath,
+          "Saves",
+          "Multiplayer",
+        );
+        if (fs.existsSync(baseSavesPath)) {
+          // Look for a folder that matches the server name (case-insensitive)
+          const folders = fs
+            .readdirSync(baseSavesPath, { withFileTypes: true })
+            .filter((d) => d.isDirectory())
+            .map((d) => d.name);
+          // First try exact match
+          const exactMatch = folders.find((f) => f === activeServer.serverName);
+          if (exactMatch) {
+            return path.join(baseSavesPath, exactMatch);
+          }
+          // Then try case-insensitive match
+          const caseInsensitiveMatch = folders.find(
+            (f) => f.toLowerCase() === activeServer.serverName.toLowerCase(),
+          );
+          if (caseInsensitiveMatch) {
+            return path.join(baseSavesPath, caseInsensitiveMatch);
+          }
+          // Only use first folder as last resort with a warning
+          if (folders.length > 0) {
+            log.warn(
+              `Could not find save folder matching "${activeServer.serverName}", using first available: ${folders[0]}`,
+            );
+            return path.join(baseSavesPath, folders[0]);
+          }
+        }
+      }
+
+      // Fallback to legacy settings
+      const zomboidDataPath = await getSetting("zomboidDataPath");
+      const serverName = await getSetting("serverName");
+
+      if (zomboidDataPath && serverName) {
+        if (!dataFolderUsable(null, zomboidDataPath)) return null;
+        return path.join(zomboidDataPath, "Saves", "Multiplayer", serverName);
+      }
+
+      return null;
+    } catch (error) {
+      log.error(`Failed to get saves path: ${error.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Read-only resolution of the data directory a server's backups/ folder
+   * lives under -- the same fallback chain getBackupsPath() below applies,
+   * pulled out so cross-server ownership checks (see
+   * _excludeOtherServersBackups()/_findForeignBackupOwner() further down)
+   * can ask "where would THIS OTHER server's backups be" without also
+   * getBackupsPath()'s own side effect of creating that directory on disk
+   * for a server that may not even have any backups yet.
+   */
+  async _resolveServerDataBasePath(activeServerOverride) {
+    const activeServer =
+      activeServerOverride !== undefined
+        ? activeServerOverride
+        : await getActiveServer();
+
+    // PATHS-1: see dataFolderUsable(). Also keeps a remote server from
+    // falling through to the legacy setting's folder or the panel's own.
+    if (activeServer?.isRemote) return null;
+
+    if (activeServer?.zomboidDataPath) {
+      return dataFolderUsable(activeServer, activeServer.zomboidDataPath)
+        ? activeServer.zomboidDataPath
+        : null;
+    }
+
+    const legacyPath = await getSetting("zomboidDataPath");
+    if (legacyPath) return dataFolderUsable(null, legacyPath) ? legacyPath : null;
+
+    // Use local backups folder as fallback
+    const { getDataPaths } = await import("../utils/paths.js");
+    return getDataPaths().dataDir;
+  }
+
+  /**
+   * Get the backups folder path.
+   *
+   * `activeServerOverride` -- see getSavesPath()'s comment just above for
+   * the full rationale; same optional-reuse parameter, same "every
+   * existing caller passes nothing and keeps its own always-fresh read"
+   * guarantee.
+   *
+   * SECURITY (2026-10-05, PT1): `create` -- only the callers about to write
+   * a backup into the folder (createBackup(), the upload route) create it.
+   * Every call used to, so GET /list and /status -- which only read --
+   * created <data folder>/backups, and the data folder with it when it
+   * didn't exist yet: a technician saved <folder>/Saves as a server's data
+   * folder (missing, so accepted), opened Backups, and <folder> then had
+   * the Saves folder the data-folder rule took as a sign of a real one.
+   * The folder it creates in is one _resolveServerDataBasePath() held to
+   * that rule, as before.
+   */
+  async getBackupsPath(activeServerOverride, { create = false } = {}) {
+    try {
+      const basePath = await this._resolveServerDataBasePath(activeServerOverride);
+      if (!basePath) return null;
+      const backupsPath = path.join(basePath, "backups");
+
+      if (create && !fs.existsSync(backupsPath)) {
+        fs.mkdirSync(backupsPath, { recursive: true });
+      }
+
+      return backupsPath;
+    } catch (error) {
+      log.error(`Failed to get backups path: ${error.message}`);
+      return null;
+    }
+  }
+
+  // continuous-bug-hunt round 18 (backups and server ownership): unlike
+  // Saves/Multiplayer/<serverName>, a server's backups/ folder is just
+  // `<zomboidDataPath>/backups` -- no serverName segment in the PATH at
+  // all, only encoded in each FILE's own name (`${serverName}_${timestamp}
+  // .zip`, see createBackup() above). getBackupsPath() falls back to the
+  // app-wide legacy `zomboidDataPath` setting (or PZ_SAVE_PATH via
+  // routes/servers.js's own default) whenever a server profile doesn't
+  // have its OWN zomboidDataPath configured -- a perfectly ordinary state
+  // for a newly added second server profile, or any server never
+  // individually pointed at its own data folder. When that happens, TWO
+  // (or more) server profiles resolve to the exact SAME backups/ directory
+  // with nothing anywhere checking which file belongs to which server --
+  // every consumer (this list, cleanupOldBackups' automatic pruning,
+  // restore, delete) previously treated every .zip sitting in that shared
+  // folder as fair game, regardless of which server's name prefixed it.
+  //
+  // Deliberately narrow: only ever excludes something when a REAL
+  // collision is detected against a server that is CURRENTLY configured
+  // (fetched fresh, not cached) and genuinely resolves to this exact same
+  // directory -- for the overwhelming normal case (every server has its
+  // own distinct data path), every server in `others` fails the path
+  // comparison and this returns its input completely unchanged, zero
+  // behavior difference from before this fix. A backup is only ever
+  // treated as "not mine" when attributeBackupFilename() (see its own
+  // comment -- the WHOLE filename anchored against name + the exact
+  // timestamp shape, longest matching name wins, never the active
+  // server's own name) resolves it to a DIFFERENT, currently-existing,
+  // currently-colliding server -- anything else (a legacy backup
+  // predating multi-server support, one made before THIS server was
+  // renamed, an uploaded archive, or simply a name matching no known
+  // server) stays visible and prunable under this server: hiding or
+  // permanently losing track of an ambiguous-but-possibly-real backup
+  // would be a worse failure than this function occasionally
+  // under-filtering.
+  async _excludeOtherServersBackups(backups, backupsPath, activeServerOverride) {
+    if (backups.length === 0) return backups;
+    try {
+      const activeServer =
+        activeServerOverride !== undefined
+          ? activeServerOverride
+          : await getActiveServer();
+      const allServers = await getServers();
+      const others = allServers.filter(
+        (s) => String(s.id) !== String(activeServer?.id ?? ""),
+      );
+      if (others.length === 0) return backups;
+
+      const collidingOtherNames = new Set();
+      const resolvedBackupsPath = path.resolve(backupsPath);
+      for (const other of others) {
+        const otherBasePath = await this._resolveServerDataBasePath(other);
+        if (!otherBasePath) continue;
+        const otherBackupsPath = path.resolve(path.join(otherBasePath, "backups"));
+        if (
+          otherBackupsPath === resolvedBackupsPath &&
+          typeof other.serverName === "string" &&
+          other.serverName
+        ) {
+          collidingOtherNames.add(other.serverName);
+        }
+      }
+      if (collidingOtherNames.size === 0) return backups;
+
+      const ownName =
+        typeof activeServer?.serverName === "string" && activeServer.serverName
+          ? activeServer.serverName
+          : null;
+      const candidates = ownName ? [ownName, ...collidingOtherNames] : [...collidingOtherNames];
+
+      return backups.filter((b) => {
+        const owner = attributeBackupFilename(b.name, candidates);
+        if (owner && owner !== ownName) {
+          log.warn(
+            `Backup "${b.name}" sits in a backups folder shared with another server profile ("${owner}") -- excluded from this server's list/pruning`,
+          );
+          return false;
+        }
+        return true;
+      });
+    } catch (error) {
+      log.warn(`Could not check for cross-server backup ownership: ${error.message}`);
+      return backups; // fail open to the pre-fix behavior, not a blank list
+    }
+  }
+
+  // Single-name variant of the check above, for the destructive single-file
+  // operations (restore, delete) that don't go through listBackups() at
+  // all. Returns the OTHER server's name if `name` belongs to it (a real,
+  // currently-colliding server), else null -- including whenever
+  // attributeBackupFilename() resolves it to the ACTIVE server's own name
+  // instead, so this server's own file is never refused as foreign.
+  async _findForeignBackupOwner(name, backupsPath, activeServerOverride) {
+    try {
+      const activeServer =
+        activeServerOverride !== undefined
+          ? activeServerOverride
+          : await getActiveServer();
+      const allServers = await getServers();
+      const others = allServers.filter(
+        (s) => String(s.id) !== String(activeServer?.id ?? ""),
+      );
+      if (others.length === 0) return null;
+
+      const resolvedBackupsPath = path.resolve(backupsPath);
+      const collidingOtherNames = new Set();
+      for (const other of others) {
+        if (typeof other.serverName !== "string" || !other.serverName) continue;
+        const otherBasePath = await this._resolveServerDataBasePath(other);
+        if (!otherBasePath) continue;
+        const otherBackupsPath = path.resolve(path.join(otherBasePath, "backups"));
+        if (otherBackupsPath === resolvedBackupsPath) {
+          collidingOtherNames.add(other.serverName);
+        }
+      }
+      if (collidingOtherNames.size === 0) return null;
+
+      const ownName =
+        typeof activeServer?.serverName === "string" && activeServer.serverName
+          ? activeServer.serverName
+          : null;
+      const candidates = ownName ? [ownName, ...collidingOtherNames] : [...collidingOtherNames];
+
+      const owner = attributeBackupFilename(name, candidates);
+      return owner && owner !== ownName ? owner : null;
+    } catch (error) {
+      log.warn(`Could not check backup ownership for ${name}: ${error.message}`);
+      return null; // fail open, same posture as _excludeOtherServersBackups
+    }
+  }
+
+  /**
+   * Get backup settings
+   */
+  async getSettings() {
+    const enabled = (await getSetting("backupEnabled")) ?? false;
+    const schedule = (await getSetting("backupSchedule")) ?? "0 */6 * * *"; // Every 6 hours
+    const maxBackups = (await getSetting("backupMaxCount")) ?? 10;
+    const includeDb = (await getSetting("backupIncludeDb")) ?? false;
+
+    return { enabled, schedule, maxBackups, includeDb };
+  }
+
+  /**
+   * Update backup settings
+   */
+  async updateSettings(settings) {
+    if (
+      settings.enabled !== undefined &&
+      typeof settings.enabled !== "boolean"
+    ) {
+      throw new Error("enabled must be a boolean");
+    }
+    if (
+      settings.maxBackups !== undefined &&
+      (!Number.isInteger(settings.maxBackups) ||
+        settings.maxBackups < 1 ||
+        settings.maxBackups > 100)
+    ) {
+      throw new Error("maxBackups must be an integer between 1 and 100");
+    }
+    if (
+      settings.includeDb !== undefined &&
+      typeof settings.includeDb !== "boolean"
+    ) {
+      throw new Error("includeDb must be a boolean");
+    }
+    if (
+      settings.schedule !== undefined &&
+      (!isSupportedFiveFieldCron(settings.schedule) ||
+        isCronTooFrequent(settings.schedule))
+    ) {
+      throw new Error(
+        "Invalid backup schedule. Use exactly 5 cron fields and no more than one run every 5 minutes.",
+      );
+    }
+    if (settings.enabled !== undefined) {
+      await setSetting("backupEnabled", settings.enabled);
+    }
+    if (settings.schedule !== undefined) {
+      await setSetting("backupSchedule", settings.schedule);
+    }
+    if (settings.maxBackups !== undefined) {
+      await setSetting("backupMaxCount", settings.maxBackups);
+    }
+    if (settings.includeDb !== undefined) {
+      await setSetting("backupIncludeDb", settings.includeDb);
+    }
+
+    return this.getSettings();
+  }
+
+  /**
+   * Create a backup of the server world
+   */
+  async createBackup(options = {}) {
+    if (this.backupInProgress) {
+      return { success: false, message: "Backup already in progress" };
+    }
+    // restoreBackup() already refuses a new restore (and an independent
+    // createBackup() call) while ITS OWN restoreInProgress is set -- see the
+    // `if (this.backupInProgress)` check near the top of restoreBackup()
+    // below. That guard only ever ran in one direction: a backup could
+    // still start while a restore was mid-swap (savesPath renamed out, then
+    // the extracted world renamed in), reading some files from the world
+    // being replaced and some from its replacement under the same relative
+    // names, silently. `options.isPreRestore` is the same flag
+    // restoreBackup() already passes on its OWN internal pre-restore
+    // createBackup() call (see the call site below) -- it must be exempted
+    // here, or every restore with createPreRestoreBackup !== false would
+    // refuse its own mandatory pre-restore backup the instant this check
+    // was added.
+    if (this.restoreInProgress && !options.isPreRestore) {
+      return { success: false, message: "Restore in progress, please wait" };
+    }
+
+    // continuous-bug-hunt, 2026-09-18 (backup-integrity round): scheduler.js's
+    // own scheduled-backup cron job already refuses to fire while
+    // this.scheduler.restartInProgress is true (see its comment: a restart's
+    // warning countdown + RCON save + quit + relaunch all mutate savesPath
+    // for potentially minutes, so a backup taken mid-restart can archive a
+    // save mid-write -- "a corrupt or inconsistent snapshot that looks like
+    // a normal backup until someone tries to restore it"). That check lived
+    // ONLY in the scheduler's cron callback, one caller out of several --
+    // routes/backup.js's POST /create (manual "Create Backup Now") and any
+    // other direct caller of createBackup() had no such check at all and
+    // would archive the same mid-write state, reporting success:true with an
+    // empty skippedFiles (a torn save isn't a vanished file -- nothing here
+    // would ever notice). Centralized here instead of duplicated at every
+    // call site, the same way restoreInProgress already is. No isPreRestore-
+    // style exemption needed: unlike restoreBackup(), nothing in
+    // performRestart() ever calls createBackup() itself, so there is no
+    // legitimate caller this would wrongly refuse.
+    if (this.scheduler?.restartInProgress) {
+      return { success: false, message: "A server restart is in progress, please wait" };
+    }
+
+    this.backupInProgress = true;
+    const startTime = Date.now();
+    const io = options.io; // Socket.IO for progress updates
+
+    // Helper to emit progress. The message goes through sanitizeError()
+    // here, once, rather than at each call site: several pass a raw
+    // err.message, which can quote the save or backup folder.
+    const emitProgress = (phase, percent, message, extra = {}) => {
+      if (io) {
+        io.to(BACKUP_PROGRESS_ROOM).emit("backup:progress", {
+          phase,
+          percent,
+          message: sanitizeError(message),
+          ...extra,
+        });
+      }
+    };
+
+    // Wrap in try-finally to ensure mutex is always released
+    try {
+      return await this._doCreateBackup(options, startTime, emitProgress);
+    } catch (error) {
+      log.error(`Backup failed: ${error.message}`);
+      emitProgress(
+        "error",
+        0,
+        `Backup failed: ${sanitizeError(error.message)}`,
+      );
+      return { success: false, message: sanitizeError(error.message) };
+    } finally {
+      this.backupInProgress = false;
+    }
+  }
+
+  /**
+   * Internal backup implementation
+   */
+  async _doCreateBackup(options, startTime, emitProgress) {
+    emitProgress("preparing", 5, "Preparing backup...");
+
+    // lifecycle-lock-set sweep, 2026-09-07 (Kevin's finding, backup-restore
+    // lane): POST /create takes no lifecycle lock, so a concurrent
+    // /servers/:id/activate could switch the active server between
+    // separate reads. One fresh read here, reused for the saves path, the
+    // backups path, the filename label, and the snapshot below, so all
+    // four agree on which server this backup is actually of -- restore's
+    // own two getActiveServer() calls (restoreBackup(), further down) stay
+    // as they are: restore holds the lifecycle lock for its whole
+    // duration, and /servers/:id/activate takes that same lock, so the
+    // active server provably cannot change under restore already.
+    const activeServer = await getActiveServer();
+    if (activeServer?.isRemote) {
+      throw new Error(REMOTE_BACKUPS_MESSAGE);
+    }
+    const dataPath =
+      activeServer?.zomboidDataPath || (await getSetting("zomboidDataPath"));
+    if (dataPath && !dataFolderUsable(activeServer, dataPath)) {
+      throw new Error(zomboidDataFolderRefusal().error);
+    }
+    const savesPath = await this.getSavesPath(activeServer);
+
+    if (!savesPath) {
+      throw new Error(
+        "Could not determine saves folder path. Please configure the server first.",
+      );
+    }
+
+    if (!fs.existsSync(savesPath)) {
+      throw new Error(`Saves folder not found: ${savesPath}`);
+    }
+
+    // PT1: created only now, with a world save there to write into it.
+    const backupsPath = await this.getBackupsPath(activeServer, { create: true });
+    if (!backupsPath) {
+      throw new Error("Could not determine backups folder path");
+    }
+
+    // Generate backup filename with timestamp
+    const timestamp = new Date()
+      .toISOString()
+      .replace(/[:.]/g, "-")
+      .slice(0, 23);
+    const serverName = activeServer?.serverName || "server";
+    const baseBackupName = `${serverName}_${timestamp}`;
+    let backupName = `${baseBackupName}.zip`;
+    let backupPath = path.join(backupsPath, backupName);
+    // 2026-09-09 (Kevin's cross-ring sweep, timestamp-tie-breaks): starting
+    // at 1 made the FIRST collision produce "-1.zip" -- the exact same
+    // suffix backupSortKey() (above) already implies for an unsuffixed
+    // original (`suffix: match[2] ? ... : 1`). On a real same-millisecond
+    // collision the original and its first collision then carry an
+    // IDENTICAL sort key, listBackups()'s sort can't tell them apart, and
+    // the stable sort falls back to readdir() order -- unrelated to
+    // creation order -- which cleanupOldBackups()'s .slice(maxBackups)
+    // deletion and `this.lastBackup = backups[0]` both trust completely.
+    // Starting at 2 instead matches every sibling ring's identical
+    // convention (database/init.js, utils/configBackup.js, index.js's
+    // player-export rotation) -- an unsuffixed original and a first
+    // collision can never collapse to one key.
+    let collision = 2;
+    while (fs.existsSync(backupPath)) {
+      backupName = `${baseBackupName}-${collision}.zip`;
+      backupPath = path.join(backupsPath, backupName);
+      collision++;
+    }
+    // Write under a name listBackups() won't match (it only lists *.zip), and
+    // rename into place only after the archive closes successfully -- writing
+    // straight to backupPath meant a process kill mid-archive left a
+    // truncated file at the real, listed filename, indistinguishable in the
+    // UI from a real backup until someone tried to restore it.
+    const tempBackupPath = `${backupPath}.tmp`;
+    cleanupOrphanBackupTemps(backupsPath);
+    const serverSnapshot = captureBackupSnapshot(activeServer);
+
+    log.info(`Starting backup: ${backupName}`);
+    log.info(`Source: ${savesPath}`);
+    log.info(`Destination: ${backupPath}`);
+
+    emitProgress("preparing", 10, "Scanning files...");
+
+    // Count total files for progress without materializing directory listings.
+    let totalFiles = 0;
+
+    try {
+      totalFiles = await countFiles(savesPath);
+    } catch (err) {
+      log.warn(`Failed to count files: ${err.message}`);
+      totalFiles = 1000; // Fallback estimate
+    }
+
+    // Get database path if needed (before entering Promise callback)
+    let dbPathToInclude = null;
+    if (options.includeDb) {
+      // Same defect class as database/init.js's createDatabaseBackup() (fixed
+      // alongside this, 2026-09-05 backup-restore-round-trip hunt): db.json
+      // writes are debounced (up to WRITE_DEBOUNCE_MS=500ms, longer under
+      // retry backoff) and this archives whatever is CURRENTLY ON DISK --
+      // without flushing first, a world backup taken right after a settings/
+      // server/role change can silently ship a db.json missing that change.
+      await flushWrites();
+      const { getDataPaths } = await import("../utils/paths.js");
+      const dbPath = getDataPaths().dbPath;
+      if (fs.existsSync(dbPath)) {
+        dbPathToInclude = dbPath;
+        totalFiles++;
+      }
+    }
+
+    emitProgress("archiving", 15, `Found ${totalFiles} files to backup...`, {
+      totalFiles,
+    });
+
+    // Create zip archive
+    const output = createWriteStream(tempBackupPath);
+    const archive = archiver("zip", {
+      zlib: { level: 6 }, // Moderate compression
+    });
+
+    let filesProcessed = 0;
+    // Every archive addition (saves-folder walk, the snapshot, db.json) goes
+    // through waitForArchiveEntry, so this collects every skip precisely --
+    // not a sampled backstop, the complete account.
+    const skippedFiles = [];
+
+    return new Promise((resolve, reject) => {
+      // Track progress during archiving
+      archive.on("entry", (entry) => {
+        filesProcessed++;
+        const percent = Math.min(
+          15 + Math.round((filesProcessed / totalFiles) * 75),
+          90,
+        );
+        if (filesProcessed % 50 === 0 || filesProcessed === totalFiles) {
+          emitProgress(
+            "archiving",
+            percent,
+            `Archiving files... (${filesProcessed}/${totalFiles})`,
+            {
+              filesProcessed,
+              totalFiles,
+              currentFile: entry.name,
+            },
+          );
+        }
+      });
+
+      output.on("close", async () => {
+        emitProgress("finalizing", 95, "Finalizing backup...");
+
+        // Only now, with the archive fully written and closed, does it become
+        // the real backup. Anything that dies before this line leaves nothing
+        // but an already-excluded .tmp file behind.
+        try {
+          fs.renameSync(tempBackupPath, backupPath);
+        } catch (renameError) {
+          emitProgress(
+            "error",
+            0,
+            `Backup failed: ${renameError.message}`,
+          );
+          reject(renameError);
+          return;
+        }
+
+        const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+        const sizeBytes = archive.pointer();
+        const sizeMB = (sizeBytes / (1024 * 1024)).toFixed(2);
+
+        if (skippedFiles.length > 0) {
+          // "vanished during archiving" until 2026-08-29 -- no longer
+          // accurate now that a deliberately-excluded symbolic link also
+          // lands in this same array (see walkDirectory's own comment);
+          // kept cause-agnostic since both reasons already get identical
+          // treatment by every consumer of skippedFiles.
+          log.warn(
+            `Backup ${backupName} completed but ${skippedFiles.length} file(s) could not be included: ${skippedFiles.join(", ")}`,
+          );
+        } else {
+          log.info(
+            `Backup completed: ${backupName} (${sizeMB} MB) in ${duration}s`,
+          );
+        }
+
+        this.lastBackup = {
+          name: backupName,
+          path: backupPath,
+          size: sizeBytes,
+          created: new Date().toISOString(),
+        };
+
+        try {
+          await addBackupRecord({
+            backup: this.lastBackup,
+            server: activeServer,
+            snapshot: serverSnapshot,
+          });
+        } catch (error) {
+          log.warn(`Backup record could not be saved for ${backupName}: ${error.message}`);
+        }
+
+        try {
+          await logServerEvent("backup_created", `${backupName} (${sizeMB} MB)`);
+        } catch (error) {
+          log.warn(
+            `Backup event could not be logged for ${backupName}: ${error.message}`,
+          );
+        }
+
+        // Clean up old backups -- but NEVER as part of a pre-restore or
+        // pre-wipe safety backup. bug hunt 2026-09-05 (backup-restore-
+        // round-trip sweep, item #1): this used to run unconditionally,
+        // "including the mandatory pre-wipe and pre-restore ones" per the
+        // comment that used to be here -- which meant restoring your OLDEST
+        // backup (an entirely ordinary thing to do) could have its own
+        // pre-restore backup push the count over maxBackups, prune the
+        // oldest survivor, and delete the very archive restoreBackup() was
+        // about to read from a few lines later. Reproduced directly:
+        // maxBackups=1, one existing backup, restore it with the default
+        // createPreRestoreBackup:true -- the prune deletes it and the
+        // restore then fails with ENOENT reading its own source archive.
+        // Deferring retention to the next ROUTINE backup costs nothing (the
+        // panel is never long without one) and removes the interaction
+        // entirely, rather than trying to special-case "protect this one
+        // filename from this one prune pass".
+        //
+        // cleanupOldBackups() already has its own full internal try/catch
+        // and cannot reject today -- but this caller must not depend on
+        // that staying true forever: an unguarded reject here would be an
+        // unhandledRejection -> fatalExit() panel kill sitting directly
+        // downstream of every destructive operation in the app (2026-08-26,
+        // same class as the install setSetting crash). Retention
+        // housekeeping failing does NOT mean the backup failed -- log and
+        // continue, never flip the backup result or abort whatever
+        // destructive step is waiting on it.
+        if (!options.isPreRestore && !options.isPreWipe) {
+          try {
+            await this.cleanupOldBackups(activeServer);
+          } catch (cleanupError) {
+            log.warn(`Backup retention cleanup failed for ${backupName}: ${cleanupError.message}`);
+          }
+        }
+
+        emitProgress(
+          "complete",
+          100,
+          `Backup complete! (${sizeMB} MB in ${duration}s)`,
+        );
+
+        // Notify Discord of completed backup
+        if (this.discordBot) {
+          this.discordBot
+            .sendEventNotification("backupComplete", {})
+            .catch((err) =>
+              log.debug(
+                `Discord backupComplete notification failed: ${err.message}`,
+              ),
+            );
+        }
+
+        // Surfaced, not decided here: the transition (write + rename) really
+        // did succeed, so success stays true -- but WHETHER a skip is
+        // acceptable depends on why this backup was taken, which only the
+        // caller knows. A routine/scheduled backup tolerates skips and
+        // reports them; a backup taken immediately before a destructive
+        // operation (restoreBackup's pre-restore backup, /wipe's pre-wipe
+        // backup) is about to become the only copy and must treat any skip
+        // as a failure. That policy lives at those call sites, not here.
+        resolve({
+          success: true,
+          backup: this.lastBackup,
+          duration: parseFloat(duration),
+          skippedFiles,
+        });
+      });
+
+      // Best-effort: remove whatever partial bytes made it to disk so a
+      // failed run doesn't leave a stray .tmp file behind. Not the listed
+      // backup name (already excluded by listBackups()'s .zip filter), so
+      // this is cleanliness, not the safety property -- that's the rename.
+      const cleanupTemp = () => {
+        fs.rm(tempBackupPath, { force: true }, (cleanupErr) => {
+          if (cleanupErr) {
+            log.warn(
+              `Could not remove incomplete backup file ${tempBackupPath}: ${cleanupErr.message}`,
+            );
+          }
+        });
+      };
+
+      output.on("error", (err) => {
+        emitProgress("error", 0, `Backup failed: ${err.message}`);
+        cleanupTemp();
+        reject(err);
+      });
+
+      archive.on("error", (err) => {
+        emitProgress("error", 0, `Archive error: ${err.message}`);
+        cleanupTemp();
+        reject(err);
+      });
+
+      archive.on("warning", (err) => {
+        if (err.code === "ENOENT") {
+          log.warn(`Backup warning: ${err.message}`);
+        } else {
+          cleanupTemp();
+          reject(err);
+        }
+      });
+
+      archive.pipe(output);
+
+      const appendBackupContents = async () => {
+        try {
+          const skippedSaves = await appendDirectoryToArchive(
+            archive,
+            savesPath,
+            path.basename(savesPath),
+          );
+          skippedFiles.push(...skippedSaves);
+
+          const snapshotResult = await waitForArchiveEntry(archive, () =>
+            archive.append(JSON.stringify(serverSnapshot, null, 2), {
+              name: "panel-server-snapshot.json",
+            }),
+          );
+          if (snapshotResult.skipped) skippedFiles.push("panel-server-snapshot.json");
+
+          if (dbPathToInclude) {
+            const dbResult = await waitForArchiveEntry(archive, () =>
+              archive.file(dbPathToInclude, { name: "db.json" }),
+            );
+            if (dbResult.skipped) skippedFiles.push("db.json");
+          }
+
+          await archive.finalize();
+        } catch (error) {
+          archive.abort();
+          cleanupTemp();
+          reject(error);
+        }
+      };
+
+      void appendBackupContents();
+    });
+  }
+
+  /**
+   * Get list of existing backups.
+   *
+   * `activeServerOverride` -- see getSavesPath()'s comment; same optional
+   * reuse parameter, threaded through to getBackupsPath() so
+   * cleanupOldBackups() (called right after a createBackup() completes)
+   * lists the SAME server's backups folder the backup just created, not a
+   * freshly re-derived one a concurrent activate() could have switched.
+   * Every other existing caller (routes/backup.js's listing route, etc.)
+   * passes nothing and keeps its own always-fresh read.
+   */
+  async listBackups(activeServerOverride) {
+    try {
+      const backupsPath = await this.getBackupsPath(activeServerOverride);
+      if (!backupsPath || !fs.existsSync(backupsPath)) {
+        return [];
+      }
+
+      const files = await fs.promises.readdir(backupsPath);
+
+      const backups = (
+        await Promise.all(
+          files
+            .filter((f) => f.endsWith(".zip"))
+            .map(async (f) => {
+              try {
+                const filePath = path.join(backupsPath, f);
+                const stats = await fs.promises.stat(filePath);
+                return {
+                  name: f,
+                  path: filePath,
+                  size: stats.size,
+                  created: stats.birthtime.toISOString(),
+                  sortKey: backupSortKey(f, stats),
+                };
+              } catch (e) {
+                return null;
+              }
+            }),
+        )
+      ).filter((b) => b !== null);
+
+      const owned = await this._excludeOtherServersBackups(
+        backups,
+        backupsPath,
+        activeServerOverride,
+      );
+
+      return owned
+        .sort((a, b) => {
+          if (a.sortKey.key !== b.sortKey.key) {
+            return a.sortKey.key < b.sortKey.key ? 1 : -1; // newest first
+          }
+          return b.sortKey.suffix - a.sortKey.suffix; // higher collision suffix = created later
+        })
+        .map(({ sortKey: _sortKey, ...backup }) => backup); // internal-only, don't leak the key
+    } catch (error) {
+      log.error(`Failed to list backups: ${error.message}`);
+      return [];
+    }
+  }
+
+  async getBackupSnapshot(backupName) {
+    const backupsPath = await this.getBackupsPath();
+    const safeName = path.basename(backupName);
+    // LOAD-BEARING for traversal safety, not just a format check: neither
+    // "." nor ".." ends in ".zip", so this incidentally rejects both even
+    // though safeName is never compared back to backupName itself (the
+    // check every OTHER basename-sanitized route in this codebase uses).
+    // Do not relax or remove the .zip requirement without adding that
+    // explicit "." / ".." rejection first.
+    if (!backupsPath || !safeName.endsWith(".zip")) {
+      return { success: false, message: "Invalid backup file" };
+    }
+
+    const backupPath = path.join(backupsPath, safeName);
+    if (!fs.existsSync(backupPath)) {
+      return { success: false, message: "Backup not found" };
+    }
+
+    // round 19 (backup-read-paths-ownership): the write/destructive paths
+    // (deleteBackup, restoreBackup) already refuse a name that identifies
+    // another currently-colliding server's own backup -- see
+    // _findForeignBackupOwner()'s own comment -- but this READ path never
+    // checked at all, so an operator of one server could read the panel
+    // snapshot embedded inside another server's backup archive just by
+    // knowing (or guessing, from the predictable `${serverName}_${timestamp}
+    // .zip` naming) its filename.
+    const foreignOwner = await this._findForeignBackupOwner(safeName, backupsPath);
+    if (foreignOwner) {
+      return {
+        success: false,
+        message: `This backup belongs to another server profile ("${foreignOwner}") that shares this backups folder -- refusing to read it here.`,
+      };
+    }
+
+    try {
+      const unzip = await getUnzipper();
+      const archive = await unzip.Open.file(backupPath);
+      const entry = archive.files.find(
+        (file) => file.path === "panel-server-snapshot.json",
+      );
+      if (!entry) {
+        return { success: false, message: "This backup has no panel snapshot" };
+      }
+      const snapshot = JSON.parse((await entry.buffer()).toString("utf-8"));
+      return { success: true, snapshot };
+    } catch (error) {
+      log.warn(`Could not read backup snapshot from ${safeName}: ${error.message}`);
+      return { success: false, message: "Could not read backup snapshot" };
+    }
+  }
+
+  /**
+   * Delete a backup
+   */
+  async deleteBackup(backupName) {
+    try {
+      const backupsPath = await this.getBackupsPath();
+      if (!backupsPath) {
+        throw new Error("Backups folder not found");
+      }
+
+      // Sanitize filename to prevent path traversal
+      const safeName = path.basename(backupName);
+      if (!safeName.endsWith(".zip")) {
+        throw new Error("Invalid backup file");
+      }
+
+      const backupPath = path.join(backupsPath, safeName);
+
+      if (!fs.existsSync(backupPath)) {
+        throw new Error("Backup not found");
+      }
+
+      // round 18: refuse a delete whose name identifies it as another,
+      // currently-colliding server's own backup -- see
+      // _findForeignBackupOwner()'s own comment.
+      const foreignOwner = await this._findForeignBackupOwner(safeName, backupsPath);
+      if (foreignOwner) {
+        throw new Error(
+          `This backup belongs to another server profile ("${foreignOwner}") that shares this backups folder -- refusing to delete it from here.`,
+        );
+      }
+
+      fs.unlinkSync(backupPath);
+      try {
+        await removeBackupRecord(safeName);
+      } catch (error) {
+        log.warn(`Backup record could not be removed for ${safeName}: ${error.message}`);
+      }
+      log.info(`Deleted backup: ${safeName}`);
+      try {
+        await logServerEvent("backup_deleted", safeName);
+      } catch (error) {
+        // The file is already unlinked and the record already removed --
+        // a logging failure here must not turn an actually-successful
+        // delete into a reported failure (the caller would retry and get
+        // "Backup not found" for a backup that's genuinely gone).
+        log.warn(`Could not log backup_deleted event for ${safeName}: ${error.message}`);
+      }
+
+      return { success: true };
+    } catch (error) {
+      log.error(`Failed to delete backup: ${error.message}`);
+      return { success: false, message: error.message };
+    }
+  }
+
+  /**
+   * Clean up old backups based on maxBackups setting.
+   *
+   * Uploaded archives (see routes/backup.js's /upload comment -- stored
+   * with an "uploaded-" prefix precisely so they can be told apart here)
+   * are exempt from this automatic, unattended prune, full stop -- they
+   * are never counted toward maxBackups and never selected for deletion.
+   * This runs on a schedule with nobody watching; an operator who
+   * uploaded an archive specifically to preserve it must not lose it
+   * just because enough panel-created backups piled up around it.
+   * deleteBackupsOlderThan is the other pruning path and is a deliberate
+   * choice: it is operator-initiated, not automatic, so it does the
+   * opposite and includes uploads -- see its own comment.
+   */
+  async cleanupOldBackups(activeServerOverride) {
+    try {
+      const settings = await this.getSettings();
+      const backups = await this.listBackups(activeServerOverride);
+      const prunable = backups.filter((b) => !b.name.startsWith("uploaded-"));
+
+      if (prunable.length <= settings.maxBackups) {
+        return;
+      }
+
+      // Delete oldest backups
+      const toDelete = prunable.slice(settings.maxBackups);
+      for (const backup of toDelete) {
+        const deleted = await this.deleteBackup(backup.name);
+        if (!deleted?.success) {
+          // deleteBackup() only ever sets .message on failure, never
+          // .error -- this read the wrong field, so every real cleanup
+          // failure logged "unknown error" unconditionally regardless of
+          // what actually went wrong.
+          log.warn(
+            `Could not clean up old backup ${backup.name}: ${deleted?.message || "unknown error"}`,
+          );
+          continue;
+        }
+        log.info(`Cleaned up old backup: ${backup.name}`);
+      }
+    } catch (error) {
+      log.error(`Failed to cleanup old backups: ${error.message}`);
+    }
+  }
+
+  /**
+   * Delete backups older than X days -- operator-initiated (the route
+   * requires a human to submit a days value), unlike cleanupOldBackups
+   * which fires unattended on a schedule. Deliberately does NOT exempt
+   * uploaded archives: an explicit "delete everything older than X days"
+   * reasonably means what it says. Automatic pruning must never surprise
+   * an operator by taking something they deliberately preserved;
+   * an explicit bulk delete they typed in themselves is a choice they
+   * made, not a surprise. To keep a specific upload past a bulk cutoff,
+   * delete everything else and re-upload it, or use DELETE /:name to
+   * remove other backups by exact name instead of by age.
+   */
+  async deleteBackupsOlderThan(days) {
+    // Mirrors routes/backup.js's own guard -- see its comment for why
+    // Number.isInteger matters here specifically (setDate() below silently
+    // reinterprets a fractional value instead of using it as typed).
+    if (typeof days !== "number" || !Number.isInteger(days) || days < 1) {
+      return { success: false, message: "Invalid days parameter. Must be a whole number >= 1" };
+    }
+    try {
+      const backups = await this.listBackups();
+      const cutoffDate = new Date();
+      cutoffDate.setDate(cutoffDate.getDate() - days);
+
+      const toDelete = backups.filter((backup) => {
+        const backupDate = new Date(backup.created);
+        return backupDate < cutoffDate;
+      });
+
+      if (toDelete.length === 0) {
+        return {
+          success: true,
+          deleted: 0,
+          message: `No backups older than ${days} days found`,
+        };
+      }
+
+      let deletedCount = 0;
+      let failedCount = 0;
+      const deletedNames = [];
+
+      for (const backup of toDelete) {
+        const result = await this.deleteBackup(backup.name);
+        if (result.success) {
+          deletedCount++;
+          deletedNames.push(backup.name);
+        } else {
+          failedCount++;
+        }
+      }
+
+      log.info(`Deleted ${deletedCount} backups older than ${days} days`);
+
+      return {
+        success: failedCount === 0,
+        deleted: deletedCount,
+        failed: failedCount,
+        deletedNames,
+        message: `Deleted ${deletedCount} backup${deletedCount !== 1 ? "s" : ""} older than ${days} days${failedCount > 0 ? ` (${failedCount} failed)` : ""}`,
+      };
+    } catch (error) {
+      log.error(`Failed to delete old backups: ${error.message}`);
+      return { success: false, message: error.message };
+    }
+  }
+
+  /**
+   * Get backup status
+   */
+  async getStatus() {
+    const settings = await this.getSettings();
+    const backups = await this.listBackups();
+    const savesPath = await this.getSavesPath();
+    const backupsPath = await this.getBackupsPath();
+
+    // `this.lastBackup` is only ever WRITTEN by createBackup() succeeding in
+    // THIS process (line ~687) -- it starts null at construction and is
+    // never hydrated from disk, so every panel restart/update forgets it
+    // even though real backups are sitting right there. `listBackups()`
+    // above, by contrast, is always a live fs.readdir+stat scan and can
+    // never go stale. Confirmed real-world shape: an operator with 20 real
+    // backups sees "Last Backup: Never" right next to a correct non-zero
+    // backupCount on the exact same status card, right after every restart
+    // -- the moment an operator is already watching this card closest.
+    // `backups[0]` (listBackups() sorts newest-first) and `this.lastBackup`
+    // as set at line ~687 are the identical {name, path, size, created}
+    // shape -- guarded by crossProducerShapeGate.test.js's cross-producer
+    // check on this exact pair, so assigning one into the other here can't
+    // print a raw object where the UI expects `.created` to read a string.
+    // Lazy (computed here, not at construction) rather than eager: a
+    // constructor that touches the filesystem is startup cost nobody is
+    // looking at yet and is harder to test, and lazy self-heals if a backup
+    // appears via any route OTHER than createBackup() succeeding in this
+    // process -- exactly the gap that produced this bug in the first place.
+    // Backups.tsx/Dashboard.tsx/Settings.tsx's readers all already treat
+    // this generically as "the newest backup", never as "one this session
+    // made", so widening the meaning from "mine" to "the real one on disk"
+    // is what the label already claimed, not a behavior change for them.
+    // Zero backups on disk must still read "Never": backups.length === 0
+    // leaves this.lastBackup untouched (still its constructor-default null).
+    if (!this.lastBackup && backups.length > 0) {
+      this.lastBackup = backups[0];
+    }
+
+    // `lastBackup` above only ever reflects a SUCCESSFUL backup (manual or
+    // scheduled) that produced a file -- it says nothing about whether the
+    // scheduler itself has been failing. An operator can have "Auto Backup:
+    // ON" showing green for weeks while every scheduled attempt has been
+    // erroring out (bad schedule, unreachable backupsPath, disk full, ...)
+    // with the failure visible only in the panel's own log and in Schedule
+    // History, neither of which this status card surfaces. Only checked
+    // when scheduling is actually enabled -- a stale failure from before the
+    // operator turned it off isn't this card's business to report.
+    const lastScheduledAttempt = settings.enabled
+      ? await getLatestScheduleExecutionByCommand("backup")
+      : null;
+
+    // A failed scheduled attempt stops being a live problem the moment ANY
+    // backup succeeds after it -- a manual "Create Backup", a pre-restore
+    // safety backup, or a later scheduled run. Before this, only the next
+    // successful SCHEDULED run could clear the warning: manual backups never
+    // write Schedule History, so "try doing a backup" (the obvious advice,
+    // and the maintainer's, in the 2026-09-27 Discord report) left
+    // "Scheduled backup failing" on the Dashboard regardless. Read from the
+    // persisted backup records rather than lastBackup: a record is written
+    // only when createBackup() itself succeeds, whereas lastBackup can come
+    // from a listing whose newest file was merely uploaded (its timestamp
+    // says nothing about when the world was last actually backed up).
+    let recoveredAt = null;
+    if (lastScheduledAttempt && !lastScheduledAttempt.success) {
+      try {
+        const [newest] = await listBackupRecords({
+          serverId: lastScheduledAttempt.server_id ?? undefined,
+          limit: 1,
+        });
+        const failedAt = Date.parse(lastScheduledAttempt.executed_at);
+        const createdAt = Date.parse(newest?.createdAt);
+        if (Number.isFinite(failedAt) && Number.isFinite(createdAt) && createdAt > failedAt) {
+          recoveredAt = newest.createdAt;
+        }
+      } catch (error) {
+        log.debug(`Could not read backup records for the scheduled-attempt status: ${error.message}`);
+      }
+    }
+
+    return {
+      ...settings,
+      backupInProgress: this.backupInProgress,
+      restoreInProgress: this.restoreInProgress || false,
+      currentRestore: this.currentRestore,
+      lastRestore: this.lastRestore,
+      lastBackup: this.lastBackup,
+      backupCount: backups.length,
+      savesPath,
+      backupsPath,
+      savesExists: savesPath ? fs.existsSync(savesPath) : false,
+      lastScheduledBackupAttempt: lastScheduledAttempt
+        ? {
+            success: !!lastScheduledAttempt.success,
+            message: lastScheduledAttempt.message,
+            // Set when `message` is the panel's own prose (a backup given up
+            // on because a restart looked stuck -- see logScheduleExecution),
+            // so the page renders it translated; null for raw errors, and
+            // for rows written before the key existed.
+            messageKey: lastScheduledAttempt.message_key ?? null,
+            messageParams: lastScheduledAttempt.message_params ?? null,
+            executedAt: lastScheduledAttempt.executed_at,
+            // 'restart' for the pre-deferral "skipped, a restart was in
+            // progress" rows (see LEGACY_RESTART_SKIP_MESSAGE) -- not a
+            // backup that broke, and the UI words it that way. Current code
+            // never writes a skip: it holds the backup until the restart
+            // ends (scheduler.js _onScheduledBackupTick()).
+            skipReason:
+              !lastScheduledAttempt.success &&
+              lastScheduledAttempt.message === LEGACY_RESTART_SKIP_MESSAGE
+                ? "restart"
+                : null,
+            recoveredAt,
+          }
+        : null,
+    };
+  }
+
+  /**
+   * Get info about what's included in a backup
+   */
+  getBackupContentsInfo() {
+    return {
+      description: "Server world save data",
+      includes: [
+        "map_*.bin - World map chunk data",
+        "map_meta.bin - Map metadata",
+        "map_sand.bin - Sandbox settings snapshot",
+        "players/ - Player save files",
+        "vehicles.db - Vehicle data",
+        "reanimated.bin - Zombie data",
+        "worldstats.txt - World statistics",
+        "panel-server-snapshot.json - Safe server configuration snapshot",
+        "Other world-specific data files",
+      ],
+      location: "Saves/Multiplayer/{ServerName}/",
+      note: "Backups contain the entire world state. Server must be stopped before restoring.",
+    };
+  }
+
+  /**
+   * Restore a backup
+   * WARNING: This will overwrite the current world save!
+   */
+  async restoreBackup(backupName, options = {}) {
+    if (this.restoreInProgress) {
+      return { success: false, message: "Restore already in progress" };
+    }
+
+    if (this.backupInProgress) {
+      return { success: false, message: "Backup in progress, please wait" };
+    }
+
+    // Claim the lock BEFORE any await, not after. This used to be set only
+    // once the async server-running check below had already resolved,
+    // which left a real window: two near-simultaneous restoreBackup() calls
+    // both read restoreInProgress as false (neither had reached the
+    // assignment yet), both proceeded past every guard, and both extracted
+    // + swapped the save directory concurrently -- the second rename to
+    // finish silently wins over the first, with BOTH callers reported
+    // success:true and no error anywhere. Confirmed empirically (two
+    // concurrent calls, force !== true, an artificial delay inside
+    // getServerProcessDetails to widen the window), not just reasoned
+    // about -- bug-hunt-2026-08-27, backup-restore hunt. Every return in
+    // _runRestore() happens inside the try/finally below, so the flag is
+    // always released, same as the pre-restore-backup-failure path already
+    // was.
+    this.restoreInProgress = true;
+    // GH#166: the HTTP response to POST /restore/:name used to be the only
+    // place a restore's outcome existed. A restore that outlived that
+    // request (a big world past the client's timeout, a reverse proxy
+    // cutting a long request, the browser's connection dropping, the
+    // operator navigating away) had no outcome anyone could read back, and
+    // a page that had only SEEN the restore running (another tab, a reload)
+    // could never learn it ended. GET /backup/status now carries both: the
+    // restore running right now, and how the last one ended -- set before
+    // restoreInProgress clears, so a status read that sees the flag down
+    // always sees the outcome with it. `id` is the requesting page's own
+    // requestId when it sent a well-formed one, which is how that page
+    // tells its own outcome from another restore's. `preRestoreBackup`
+    // says whether this restore backed the replaced world up first (both
+    // panel pages always ask for it, an API caller may not), so a page
+    // that only watched it never claims a safety backup that isn't there.
+    // 'restore:finished' is the push for the same moment: sent once both
+    // are recorded, where restore:progress's own 'complete'/'error' fire
+    // from inside the restore, before the flag is down (and not at all for
+    // a refusal). It carries the id alone: it goes to every signed-in
+    // socket, backup capability or not, and a rollback failure's message
+    // names a host path (see publicRestoreMessage()) -- pages read the
+    // outcome from GET /backup/status, which is capability-gated.
+    const restore = {
+      id:
+        typeof options.requestId === "string" &&
+        RESTORE_REQUEST_ID_RE.test(options.requestId)
+          ? options.requestId
+          : randomUUID(),
+      backupName: path.basename(String(backupName ?? "")),
+      startedAt: new Date().toISOString(),
+      preRestoreBackup: options.createPreRestoreBackup !== false,
+    };
+    this.currentRestore = restore;
+    let result = null;
+    try {
+      result = await this._runRestore(backupName, options);
+      return result;
+    } finally {
+      this.lastRestore = {
+        ...restore,
+        finishedAt: new Date().toISOString(),
+        success: result?.success === true,
+        message:
+          result?.success === true
+            ? null
+            : publicRestoreMessage(result?.message ?? "Restore failed unexpectedly"),
+        duration: typeof result?.duration === "number" ? result.duration : null,
+      };
+      this.currentRestore = null;
+      this.restoreInProgress = false;
+      options.io?.to(BACKUP_PROGRESS_ROOM).emit("restore:finished", { id: restore.id });
+    }
+  }
+
+  // restoreBackup()'s body, run only while it holds restoreInProgress.
+  async _runRestore(backupName, options) {
+    const startTime = Date.now();
+    let stagingPath = null;
+    const io = options.io; // Socket.IO for progress updates
+
+    // Helper to emit progress. Mirrors createBackup's emitProgress exactly so
+    // the two events share a shape -- restore previously emitted nothing at
+    // all, not even for its own pre-restore-backup sub-step, because that
+    // inner createBackup() call never received io.
+    const emitProgress = (phase, percent, message, extra = {}) => {
+      if (io) {
+        io.to(BACKUP_PROGRESS_ROOM).emit("restore:progress", {
+          phase,
+          percent,
+          message: sanitizeError(message),
+          ...extra,
+        });
+      }
+    };
+
+    try {
+      // Restoring under a live server destroys the save: the running process
+      // holds the map files open, and writes its in-memory world back over
+      // whatever we extract. Prefer the richer process-state API because the
+      // boolean helper collapses a failed scan into a confirmed stop.
+      if (options.force !== true) {
+        if (!this.serverManager) {
+          // Same defect shape as the getServerProcessDetails-missing branch
+          // below, one level up: "the check isn't wired" must refuse, not
+          // silently skip straight to restore. Currently unreachable in
+          // production -- server/index.js calls setServerManager() at boot,
+          // before the only caller (routes/backup.js) is reachable, and that
+          // route also runs its own independent getServerProcessDetails check
+          // before ever calling here -- but both of those are call-graph
+          // coincidences, not guarantees this method can rely on by itself.
+          log.warn("Could not confirm server is stopped: no server manager wired");
+          return {
+            success: false,
+            message:
+              "Could not confirm the server is stopped because no server manager is available. Stop the server and try again.",
+          };
+        }
+        try {
+          let running;
+          if (typeof this.serverManager.getServerProcessDetails === "function") {
+            const processDetails =
+              await this.serverManager.getServerProcessDetails();
+            if (!processDetails || processDetails.scanFailed) {
+              log.warn("Could not confirm server is stopped: process scan failed");
+              return {
+                success: false,
+                message:
+                  "Could not confirm the server is stopped because process detection failed. Stop the server and try again.",
+              };
+            }
+            running = processDetails.running;
+          } else {
+            // No fallback to checkServerRunning() here even for an older
+            // injected manager that only implements it -- that call collapses
+            // a failed scan into a plain `false`, indistinguishable from a
+            // confirmed-stopped server, which is exactly the bug this whole
+            // guard exists to avoid. Treat "the richer check isn't available"
+            // as equivalent to a failed scan and refuse, same shape as
+            // server/index.js's Docker-update gate (handlePanelUpdateDownload).
+            return {
+              success: false,
+              message:
+                "Could not confirm the server is stopped because process detection is unavailable. Stop the server and try again.",
+            };
+          }
+
+          if (running) {
+            return {
+              success: false,
+              message:
+                "Server is still running. Stop the server before restoring a backup, otherwise the running world will overwrite the restored save.",
+            };
+          }
+        } catch (error) {
+          log.warn(`Could not confirm server is stopped: ${error.message}`);
+          return {
+            success: false,
+            message: `Could not confirm the server is stopped (${error.message}). Stop the server and try again.`,
+          };
+        }
+      }
+
+      emitProgress("preparing", 5, "Preparing restore...");
+
+      const backupsPath = await this.getBackupsPath();
+      const savesPath = await this.getSavesPath();
+
+      if (!backupsPath) {
+        throw new Error("Could not determine backups folder path");
+      }
+
+      if (!savesPath) {
+        throw new Error(
+          "Could not determine saves folder path. Please configure the server first.",
+        );
+      }
+
+      // Sanitize backup name
+      const safeName = path.basename(backupName);
+      if (!safeName.endsWith(".zip")) {
+        throw new Error("Invalid backup file");
+      }
+
+      const backupPath = path.join(backupsPath, safeName);
+
+      if (!fs.existsSync(backupPath)) {
+        throw new Error(`Backup not found: ${safeName}`);
+      }
+
+      // round 18: refuse to restore a backup whose name identifies it as
+      // another, currently-colliding server's own backup -- the sharpest
+      // version of "restore writes server A's backup into server B's
+      // saves path" this bug hunt named. See _findForeignBackupOwner()'s
+      // own comment.
+      const foreignOwner = await this._findForeignBackupOwner(safeName, backupsPath);
+      if (foreignOwner) {
+        throw new Error(
+          `This backup belongs to another server profile ("${foreignOwner}") that shares this backups folder -- refusing to restore it here.`,
+        );
+      }
+
+      log.info(`Starting restore from: ${safeName}`);
+      log.info(`Destination: ${savesPath}`);
+
+      // Create a pre-restore backup if requested
+      if (options.createPreRestoreBackup !== false) {
+        log.info("Creating pre-restore backup...");
+        emitProgress("pre-backup", 10, "Backing up current world before restoring...");
+        // Passing io through means this sub-step surfaces its own normal
+        // backup:progress events (preparing/archiving/finalizing) instead of
+        // running silently -- restore no longer looks stalled during what can
+        // be the longest part of the whole operation.
+        const preBackupResult = await this.createBackup({ isPreRestore: true, io });
+        // 2026-08-26 bug hunt: createBackup can return success:true while
+        // having silently skipped files that vanished mid-archive (a real
+        // race on a live PZ directory) -- it surfaces that via
+        // skippedFiles rather than deciding policy itself, because the same
+        // skip means different things depending on why the backup exists.
+        // THIS backup is about to become the world's only copy while
+        // restore overwrites the live save -- "mostly complete" is not a
+        // safety net here, so any skip is treated exactly like an outright
+        // backup failure, the same fail-closed posture already applied to
+        // an unconfirmed server-stopped state above.
+        const preBackupIncomplete =
+          preBackupResult.success && (preBackupResult.skippedFiles?.length ?? 0) > 0;
+        if (!preBackupResult.success || preBackupIncomplete) {
+          const reason = preBackupIncomplete
+            ? `it could not include ${preBackupResult.skippedFiles.length} file(s) (${preBackupResult.skippedFiles.join(", ")}) -- an incomplete pre-restore backup is not a safety net`
+            : preBackupResult.message;
+          log.error(`Pre-restore backup failed: ${reason}`);
+          emitProgress(
+            "error",
+            0,
+            `Cannot restore: pre-restore backup failed (${reason}). Aborting to protect save data.`,
+          );
+          return {
+            success: false,
+            message: `Cannot restore: pre-restore backup failed (${reason}). Aborting to protect save data.`,
+          };
+        }
+      }
+
+      // Get parent directory and expected folder name
+      const savesParentPath = path.dirname(savesPath);
+      const expectedFolderName = path.basename(savesPath);
+
+      // Ensure parent directory exists
+      if (!fs.existsSync(savesParentPath)) {
+        fs.mkdirSync(savesParentPath, { recursive: true });
+      }
+
+      // Extract into a staging sibling and only swap it in once extraction has
+      // fully succeeded. Deleting the live save first meant a truncated or
+      // corrupt archive destroyed the world with nothing to fall back to.
+      // A sibling keeps the swap on the same filesystem, so it stays a rename.
+      stagingPath = createRestoreStagingDir(savesParentPath);
+
+      // Extract the backup with zip-slip protection
+      log.info("Extracting backup to staging area...");
+      emitProgress("extracting", 45, "Extracting backup...");
+      const unzip = await getUnzipper();
+      const resolvedParent = path.resolve(stagingPath) + path.sep;
+
+      await new Promise((resolve, reject) => {
+        // Settle exactly once. Without this, errors on the read stream AND on
+        // an individual entry write stream could both call reject, or one of
+        // them could fire after `resolve` (a Parse 'close' while a write
+        // stream is still flushing). settle() also lets us forward a
+        // createReadStream error that pipe() does NOT propagate.
+        let settled = false;
+        const settle = (err) => {
+          if (settled) return;
+          settled = true;
+          if (err) reject(err);
+          else resolve();
+        };
+
+        // The parser emits 'close' as soon as it has read the archive, which
+        // can happen while entry files are still flushing. Resolving then
+        // leaves open handles in the staging folder, and renaming a directory
+        // that still has open handles fails with EPERM on Windows.
+        let pendingWrites = 0;
+        let parseClosed = false;
+        const settleIfComplete = () => {
+          if (parseClosed && pendingWrites === 0) settle();
+        };
+
+        const readStream = createReadStream(backupPath);
+        readStream.on("error", settle);
+
+        readStream
+          .pipe(unzip.Parse())
+          .on("entry", (entry) => {
+            try {
+              const entryPath = path.join(stagingPath, entry.path);
+              const resolvedEntry = path.resolve(entryPath);
+
+              // Block zip-slip: entry must resolve inside the target directory
+              if (!resolvedEntry.startsWith(resolvedParent)) {
+                log.error(`Zip slip attempt blocked: ${entry.path}`);
+                entry.autodrain();
+                return;
+              }
+
+              if (entry.type !== "Directory" && entry.type !== "File") {
+                log.warn(
+                  `Skipping unsupported backup entry type ${entry.type}: ${entry.path}`,
+                );
+                entry.autodrain();
+              } else if (entry.type === "Directory") {
+                fs.mkdirSync(resolvedEntry, { recursive: true });
+                entry.autodrain();
+              } else {
+                // Ensure parent directory exists
+                fs.mkdirSync(path.dirname(resolvedEntry), { recursive: true });
+                const writeStream = createWriteStream(resolvedEntry);
+                pendingWrites++;
+                // Per-entry write failures (ENOSPC, EACCES, path too long on
+                // Windows) surface as 'error' on the WriteStream and are NOT
+                // forwarded by pipe(). Without this listener the event is
+                // unhandled and crashes the process.
+                writeStream.on("error", (err) => {
+                  pendingWrites--;
+                  try {
+                    entry.unpipe(writeStream);
+                  } catch {
+                    /* ignore */
+                  }
+                  try {
+                    entry.autodrain();
+                  } catch {
+                    /* ignore */
+                  }
+                  settle(err);
+                });
+                writeStream.on("close", () => {
+                  pendingWrites--;
+                  settleIfComplete();
+                });
+                entry.on("error", settle);
+                entry.pipe(writeStream);
+              }
+            } catch (err) {
+              settle(err);
+            }
+          })
+          .on("close", () => {
+            parseClosed = true;
+            settleIfComplete();
+          })
+          .on("error", settle);
+      });
+
+      // Extraction succeeding only proves the archive was PARSEABLE -- the
+      // unzipper streaming Parse() this whole block uses reads and discards
+      // each entry's recorded CRC32 as bookkeeping and never actually
+      // recomputes it against the bytes it just wrote (confirmed empirically:
+      // a single flipped data byte inside an otherwise well-formed stored
+      // entry extracts silently with the wrong content and raises no error
+      // anywhere in the pipeline). Bit rot on backup storage, a bad copy, or
+      // a partial download would all look exactly like a healthy backup right
+      // up until this restore replaced a working world with corrupted bytes.
+      // Verify every entry's actual CRC32 against what the archive's own
+      // central directory recorded BEFORE the swap below -- staging is still
+      // disposable at this point, so a failure here costs nothing.
+      emitProgress("verifying", 80, "Verifying restored file integrity...");
+      const integrity = await this._verifyExtractedIntegrity(
+        backupPath,
+        stagingPath,
+      );
+      if (!integrity.ok) {
+        const preview = integrity.corruptFiles.slice(0, 5).join(", ");
+        const more =
+          integrity.corruptFiles.length > 5
+            ? ` (+${integrity.corruptFiles.length - 5} more)`
+            : "";
+        throw new Error(
+          `Backup archive failed integrity verification: ${integrity.corruptFiles.length} file(s) did not match their recorded checksum -- ${preview}${more}. Live save left untouched.`,
+        );
+      }
+
+      // Extraction succeeded and every file verified against the archive's
+      // own checksums. Only now is it safe to touch the live save.
+      const stagedWorldPath = this._findExtractedWorld(
+        stagingPath,
+        expectedFolderName,
+      );
+
+      if (!stagedWorldPath) {
+        throw new Error(
+          "Backup did not contain a world save folder - live save left untouched",
+        );
+      }
+
+      emitProgress("finalizing", 85, "Swapping in the restored world...");
+
+      const retiredPath = `${savesPath}.replaced-${Date.now()}`;
+      let retired = false;
+
+      if (fs.existsSync(savesPath)) {
+        fs.renameSync(savesPath, retiredPath);
+        retired = true;
+      }
+
+      try {
+        fs.renameSync(stagedWorldPath, savesPath);
+      } catch (swapError) {
+        // Put the original world back rather than leaving nothing in place.
+        if (retired) {
+          try {
+            fs.renameSync(retiredPath, savesPath);
+          } catch (rollbackError) {
+            log.error(
+              `Restore rollback failed - previous save is at ${retiredPath}: ${rollbackError.message}`,
+            );
+            throw new Error(
+              `${RESTORE_ROLLBACK_FAILED_PREFIX} It is preserved at ${retiredPath}.`,
+            );
+          }
+        }
+        throw swapError;
+      }
+
+      if (retired) {
+        try {
+          fs.rmSync(retiredPath, { recursive: true, force: true });
+        } catch (cleanupError) {
+          log.warn(
+            `Restored successfully but could not remove ${retiredPath}: ${cleanupError.message}`,
+          );
+        }
+      }
+
+      if (!fs.existsSync(savesPath)) {
+        throw new Error(
+          "Restore may have failed - saves folder not found after extraction",
+        );
+      }
+
+      // chunks.js's /chunks and /stats routes cache a scan of this save's
+      // map/ folder for a few seconds (see getMapFolderScan()'s comment).
+      // This restore just swapped that whole save in from the archive --
+      // without this, a page reload within the TTL window would show chunk
+      // counts for the PRE-restore map/ contents.
+      invalidateMapFolderScan(path.join(savesPath, "map"));
+
+      const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+      log.info(`Restore completed in ${duration}s`);
+
+      try {
+        await logServerEvent("backup_restored", `Restored from ${safeName}`);
+      } catch (eventError) {
+        log.warn(
+          `Restore event could not be logged for ${safeName}: ${eventError.message}`,
+        );
+      }
+      emitProgress("complete", 100, `Restored from ${safeName}`);
+
+      return {
+        success: true,
+        message: `Restored from ${safeName}`,
+        duration: parseFloat(duration),
+      };
+    } catch (error) {
+      log.error(`Restore failed: ${error.message}`);
+      emitProgress("error", 0, `Restore failed: ${sanitizeError(error.message)}`);
+      try {
+        await logServerEvent("restore_failed", error.message);
+      } catch (eventError) {
+        log.warn(
+          `Restore failure event could not be logged: ${eventError.message}`,
+        );
+      }
+      return { success: false, message: error.message };
+    } finally {
+      // try/finally (not manual resets at each return) so this always runs,
+      // including the early return above when the pre-restore backup fails.
+      // restoreInProgress itself is released by restoreBackup()'s own
+      // finally -- that path used to leak the flag permanently, locking out
+      // all future restores until the process was restarted.
+      if (stagingPath) {
+        try {
+          fs.rmSync(stagingPath, { recursive: true, force: true });
+        } catch (cleanupError) {
+          log.warn(
+            `Could not remove restore staging folder ${stagingPath}: ${cleanupError.message}`,
+          );
+        }
+      }
+    }
+  }
+
+  // Recomputes each extracted file's CRC32 and compares it against the value
+  // the archive's own central directory recorded for that entry -- the check
+  // the streaming extraction above never performs (see the caller's
+  // comment). unzip.Open.file() reads the central directory directly (the
+  // same API getBackupSnapshot() already uses), independent of the
+  // streaming Parse() used to extract, so a corruption that fooled one
+  // reading path is still caught by the other actually checking the number
+  // it recorded. Mirrors the exact same `path.join(stagingPath, entry.path)`
+  // mapping the extraction loop's zip-slip guard uses, so this checks
+  // precisely the files that were actually written to staging, not a
+  // parallel guess at where they'd be.
+  async _verifyExtractedIntegrity(backupPath, stagingPath) {
+    const corruptFiles = [];
+    let archive;
+    try {
+      const unzip = await getUnzipper();
+      archive = await unzip.Open.file(backupPath);
+    } catch (error) {
+      // Could not even read the central directory to verify against --
+      // fail closed rather than skip verification silently.
+      return { ok: false, corruptFiles: [`(could not read archive directory: ${error.message})`] };
+    }
+
+    for (const entry of archive.files) {
+      if (entry.type !== "File") continue;
+      const entryPath = path.join(stagingPath, entry.path);
+
+      let actualCrc32;
+      try {
+        actualCrc32 = await new Promise((resolve, reject) => {
+          let checksum = 0;
+          const stream = createReadStream(entryPath);
+          stream.on("data", (chunk) => {
+            checksum = crc32(chunk, checksum);
+          });
+          stream.on("end", () => resolve(checksum));
+          stream.on("error", reject);
+        });
+      } catch (error) {
+        // Missing on disk despite being listed in the central directory --
+        // the streaming extraction silently dropped it (an even stranger
+        // failure than a checksum mismatch, but the operator needs to know
+        // either way, not have it discovered only inside the swapped-in world).
+        corruptFiles.push(`${entry.path} (missing after extraction: ${error.message})`);
+        continue;
+      }
+
+      if (actualCrc32 !== entry.crc32) {
+        corruptFiles.push(entry.path);
+      }
+    }
+
+    return { ok: corruptFiles.length === 0, corruptFiles };
+  }
+
+  // A backup normally wraps the world in its server-name folder, but older or
+  // hand-made archives may use a different name or none at all.
+  _findExtractedWorld(stagingPath, expectedFolderName) {
+    const looksLikeWorld = (dir) =>
+      fs.existsSync(path.join(dir, "map_meta.bin")) ||
+      fs.existsSync(path.join(dir, "map_t.bin"));
+
+    const expected = path.join(stagingPath, expectedFolderName);
+    if (fs.existsSync(expected) && fs.statSync(expected).isDirectory()) {
+      return expected;
+    }
+
+    if (looksLikeWorld(stagingPath)) {
+      return stagingPath;
+    }
+
+    const candidates = [];
+    const pending = [stagingPath];
+    while (pending.length > 0) {
+      const current = pending.pop();
+      let entries;
+      try {
+        entries = fs.readdirSync(current, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      if (current !== stagingPath && looksLikeWorld(current)) {
+        candidates.push(current);
+        continue;
+      }
+      for (const entry of entries) {
+        if (entry.isDirectory()) pending.push(path.join(current, entry.name));
+      }
+    }
+
+    return candidates.length === 1 ? candidates[0] : null;
+  }
+}
